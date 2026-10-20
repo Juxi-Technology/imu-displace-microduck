@@ -1,0 +1,2969 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 0d0a912..11a785a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1119,7 +1119,9 @@ name = "duck-control"
+ version = "0.17.2"
+ dependencies = [
+  "duck-ipc-proto",
++ "embedded-hal",
+  "libloading 0.8.9",
++ "linux-embedded-hal",
+  "ort",
+  "rustypot",
+  "serde",
+diff --git a/IMU-MODULE.en.md b/IMU-MODULE.en.md
+new file mode 100644
+index 0000000..3b1b56a
+--- /dev/null
++++ b/IMU-MODULE.en.md
+@@ -0,0 +1,198 @@
++# Replacing the trunk IMU with an I²C module (ICM-42670-P)
++
++Swap the trunk IMU from the `imu_to_dxl` board — which rides the servo bus pretending to be
++Dynamixel ID 200 — to an off-the-shelf module on I²C.
++
++Written for **HD-1910 builds**. It touches the IMU only; **the servo protocol is unchanged**.
++
++> **Status**: the IMU data path is finished and verified on real hardware (sampling, decoding,
++> observation slots). **The runtime (`robotd`) is not wired up yet** — see
++> [Wiring it into the runtime](#wiring-it-into-the-runtime). What works today is the bench
++> tooling.
++
++---
++
++## Why it is not "wire it to the bus and answer as ID 200"
++
++ID 200 is a device number on the **Dynamixel bus**, not an I²C address. They are different
++physical layers and different protocols:
++
++| | Servo bus | I²C |
++|---|---|---|
++| Physical layer | single-wire half-duplex TTL | two wires, SDA/SCL |
++| Rate | 1 Mbps | 100 / 400 kHz |
++| Protocol | Dynamixel Protocol V2 | register reads and writes |
++| Identity | ID (0–253) | slave address (7 bit) |
++| Device | `/dev/ttyS2` | `/dev/i2c-N` |
++
++**An I²C module on the HAT's I²C header is `0x23` and stays `0x23`.** Nothing translates that
++into ID 200. To appear on the bus as a servo you would need an MCU in between re-implementing
++`imu_to_dxl`'s timing — which is not worth it.
++
++Instead the host reads **two buses separately**: servos on the servo bus, the IMU over I²C, and
++merges them into `Sensors`.
++
++That buys more than skipping a custom board: **it separates the failure domains**. In the
++original arrangement, an IMU board that fails to answer invalidates the whole `sync_read` and
++all fifteen servos lose their data for that tick. Apart, a dead IMU means no attitude while the
++joints carry on.
++
++---
++
++## Hardware
++
++| | |
++|---|---|
++| Module | ICM-42670-P, I²C slave **0x23** |
++| Wiring | **GND / 3V3 / SDA / SCL** |
++| Supply | **3V3**. Not 5V — the host's I/O is 3.3 V |
++| Bus | HAT: `/dev/i2c-pihat` (the overlay's symlink) = `/dev/i2c-3`; `/dev/i2c-4` after moving J6's R18/R19 to R16/R17 |
++| Address conflicts | J5 already carries 0x18 (audio), 0x19/0x68 or 0x6A (onboard IMU), 0x29 (ToF) — **0x23 collides with none** |
++
++Enabling the bus: the HAT needs the `i2c3-pihat` overlay (at the cost of USB-C PD negotiation);
++Raspberry Pi uses `raspi-config`; Jetson uses `jetson-io.py`.
++
++```bash
++sudo apt install -y i2c-tools
++i2cdetect -l
++sudo i2cdetect -y -r <bus>
++```
++
++Continue only when `0x23` appears. If it does not, that is wiring, power or a wrong bus number —
++not the code.
++
++---
++
++## Quick verification
++
++Three layers, in order. **Only the module is needed; no servos.**
++
++```bash
++# 1. Transport: rate, dropped reads, bus time
++cargo run -p duck-control --example imu_probe -- /dev/i2c-7 20
++
++# 2. Observation wiring: does the IMU land in the six slots the policy reads
++cargo run -p duck-control --example imu_to_observation -- /dev/i2c-7 20
++
++# 3. Pose capture (for calibration)
++cargo run -p duck-control --example imu_mount -- /dev/i2c-7
++cargo run -p duck-control --example imu_mount -- /dev/i2c-7 --capture level
++```
++
++**Expected** (Jetson Orin Nano + `/dev/i2c-7`, measured):
++
++| | |
++|---|---|
++| Sample rate | 99.4 Hz, no read failures |
++| Bus time | 0.92 ms per sample |
++| `rejected quats` | 1–2% |
++| Step 2 | `obs[0..3]` / `obs[3..6]` / joint blocks **zero mismatches** |
++
++---
++
++## Wiring it into the runtime
++
++The `duck-control` side is ready; **the `robotd` side is not written**.
++
++| | |
++|---|---|
++| `DynamixelIo::open_without_bus_imu()` — stops asking for id 200 | ✅ |
++| `ExternalImuIo::new(joints, module, mount)` — merges into `Sensors` | ✅ |
++| Config keys (bus path / mount / source selection) | ⛔ needs `robotd-params` + `deploy/robotd.toml` |
++| `robotd` choosing the construction path from config | ⛔ still calls `DynamixelIo::open` unconditionally |
++| IMU thread + shared slot | ⛔ **`ExternalImuIo` reads synchronously**, about 1 ms per tick |
++| Startup self-check | ⛔ `imu_answers()` returns `false` in the no-board mode; the startup check must follow |
++
++Code layout:
++
++| File | Purpose |
++|---|---|
++| `imu_icm42670p.rs` | decode: module registers → `ImuData` (gyro ±2000 dps, float32 quaternion with `w`) |
++| `imu_i2c.rs` | transport: `RegisterBlocks` trait, register map, bus scan |
++| `imu_external.rs` | merge: `ExternalImuIo` |
++| `bus.rs` | `open_without_bus_imu()` |
++
++---
++
++## Calibrating the mount
++
++The mount is the rotation from **module frame to trunk frame**. It cannot be determined without
++the trunk — there is nothing for the rotation to be relative to.
++
++Reference mounting: the module's axes coincide with the trunk's (**X forward / Y left / Z up**),
++which physically means **component side up, Type-C aft**. That gives
++**mount = `[1, 0, 0, 0]`**.
++
++The module's own frame (measured, three orthogonal poses):
++
++| Pose | gravity (the world's *down* in module axes) |
++|---|---|
++| Flat, component side up | `[0, 0, -1]` |
++| Type-C up | `[1, 0, 0]` |
++| On edge, component face right | `[0, 1, 0]` |
++
++⇒ flat: **+X points away from the Type-C end, +Y to your right, +Z up** (component-face normal).
++
++`imu_mount` discards the first 3 s of a capture, averages the next 5, and reports **spread** —
++the largest deviation inside the window. Above 0.1 it refuses to save, because **a pose that
++moved is worse than no pose: it looks like data.**
++
++> ⚠️ A different mounting needs a new mount. **Being 90° out passes every electrical check**;
++> the symptom is only that the duck falls the wrong way.
++
++---
++
++## Acceptance checklist (once fitted)
++
++| Check | Pass |
++|---|---|
++| Standing | gravity ≈ `[0, 0, -1]` |
++| Rotate 90° about trunk X | ≈ `[0, ±1, 0]` |
++| Rotate 90° about trunk Y | ≈ `[±1, 0, 0]` |
++| Gyro signs | correct on X for a roll right, on Y for a nod down |
++| 50 Hz period | not slowed by the I²C read |
++| Continuous run | zero read failures |
++
++**The two axis checks are not optional**: gravity is blind to yaw, and a yaw error swaps roll
++and pitch rates while every electrical check still passes.
++
++---
++
++## Known behaviour (not faults)
++
++| Symptom | Explanation |
++|---|---|
++| **About 1–2 reads in 100 return an all-zero block** | The module clears the block before writing its fused result, an ~80 µs window. The decoder's norm guard rejects it and holds the previous sample. **Do not remove that check** — without it an all-zero quaternion reads as "the robot is upright". The rate is **independent of rotation speed** (1–3% at every speed) |
++| **The raw gyro reads exactly 0 when still** | A stillness gate, not a dead sensor. **Its threshold is far below anything the robot does**: the gyro reports at a true rate of 0.14 °/s, and 97% of intervals below 0.5 °/s are live — **slow motion is not clipped** |
++| **It runs at 100 Hz out of the box** | The protocol sheet says 25 Hz; measured 100 Hz. The setting is stored in flash, so check a new module |
++| **The quaternion norm is about 0.998** | That is what the module gives; the decoder normalises |
++| The first sample after start-up is the initial state | The median needs two priors; exact from the second sample. `ready()` is false for the first 25 |
++
++---
++
++## Not verified yet
++
++| | Why |
++|---|---|
++| The bus going from 16 blocks to 15 | Needs a real bus with fifteen servos |
++| The runtime wiring | Not implemented |
++| **Whether the policy still walks** | Needs a complete robot. A different IMU changes the observation distribution, which the simulation does not model |
++
++---
++
++## Rolling back
++
++Every change is inside `duck-control`, and the bus keeps its original path: construct with
++`DynamixelIo::open()` as before and the IMU is on the bus again. Nothing else changes.
++
++---
++
++## Measurement record
++
++| | Value | Environment |
++|---|---|---|
++| Unit tests | 111 passed | Windows + aarch64 |
++| Sample rate / dropped reads | 99.4 Hz / 0 | Jetson Orin Nano + `/dev/i2c-7` |
++| Bus time | 0.92 ms per sample (bus inferred at 400 kHz from timing) | same |
++| Rejected quaternions | 1.3 / 1.7 / 1.8% (100 Hz); 0.10% (50 Hz loop) | same |
++| Stillness gate | live at 0.14 °/s; 97% live below 0.5 °/s | same, `imu_gate`, 3975 samples |
+diff --git a/IMU-MODULE.md b/IMU-MODULE.md
+new file mode 100644
+index 0000000..329f92e
+--- /dev/null
++++ b/IMU-MODULE.md
+@@ -0,0 +1,177 @@
++# 用 I²C IMU 模块替换躯干 IMU（ICM-42670-P）
++
++把躯干 IMU 从 `imu_to_dxl` 小板（挂在舵机总线上、冒充 ID 200）换成一颗走 I²C 的现成模块。
++
++面向 **HD-1910 舵机的复刻**。只涉及 IMU，**不改舵机协议**。
++
++> **状态**：IMU 数据链已完成并在真硬件上验证（采样、解码、观测槽位）。**运行时（`robotd`）尚未接线**——见 [接入运行时](#接入运行时)。现在能用的是板凳验证工具。
++
++---
++
++## 为什么不是"接到总线上冒充 ID 200"
++
++ID 200 是 **Dynamixel 总线**上的设备编号，不是 I²C 地址。两者是不同的物理层和协议：
++
++| | 舵机总线 | I²C |
++|---|---|---|
++| 物理层 | 单线半双工 TTL | SDA / SCL 两线 |
++| 速率 | 1 Mbps | 100 / 400 kHz |
++| 协议 | Dynamixel Protocol V2 | 寄存器读写 |
++| 标识 | ID（0–253）| 从机地址（7 bit）|
++| 设备 | `/dev/ttyS2` | `/dev/i2c-N` |
++
++**I²C 模块接到 HAT 的 I²C 口上，永远是 `0x23`，不会变成 ID 200。** 想让它在总线上冒充舵机，必须中间加一颗 MCU 重新实现 `imu_to_dxl` 的那套硬时序——没必要。
++
++本方案让主控**分别读两条总线**：舵机走总线，IMU 走 I²C，在 `Sensors` 层合并。
++
++这样做的好处不只是省一块自制板：**故障域分开了**。原方案里 IMU 板不答会让整笔 `sync_read` 作废，15 颗舵机一起丢数据；分开之后 IMU 挂了只是没有姿态，关节照常。
++
++---
++
++## 硬件
++
++| 项 | 值 |
++|---|---|
++| 模块 | ICM-42670-P，I²C 从机 **0x23** |
++| 接线 | 模块 **GND / 3V3 / SDA / SCL** |
++| 供电 | **3V3**。不要 5V——主控 I/O 是 3.3V |
++| 总线 | HAT：`/dev/i2c-pihat`（overlay 建的链接）＝ `/dev/i2c-3`；J6 改过 R16/R17 后是 `/dev/i2c-4` |
++| 地址冲突 | J5 上已有 0x18（音频）、0x19/0x68 或 0x6A（板载 IMU）、0x29（ToF）——**0x23 都不冲突** |
++
++启用总线：HAT 装 `i2c3-pihat` overlay（代价：USB-C 不再协商 PD）；树莓派 `raspi-config`；Jetson `jetson-io.py`。
++
++```bash
++sudo apt install -y i2c-tools
++i2cdetect -l
++sudo i2cdetect -y -r <bus>
++```
++
++看到 `0x23` 再往下。看不到是接线/供电/总线号的问题，与代码无关。
++
++---
++
++## 快速验证
++
++三层，每层通过再下一层。**只需要模块，不需要舵机。**
++
++```bash
++# 1. 传输层：速率、丢帧、总线耗时
++cargo run -p duck-control --example imu_probe -- /dev/i2c-7 20
++
++# 2. 观测接线：IMU 是否落在策略读的那六个槽位
++cargo run -p duck-control --example imu_to_observation -- /dev/i2c-7 20
++
++# 3. 姿态采集（标定用）
++cargo run -p duck-control --example imu_mount -- /dev/i2c-7
++cargo run -p duck-control --example imu_mount -- /dev/i2c-7 --capture level
++```
++
++**期望**（Jetson Orin Nano + `/dev/i2c-7`，实测）：
++
++| 指标 | 值 |
++|---|---|
++| 采样率 | 99.4 Hz，0 次读失败 |
++| 总线耗时 | 0.92 ms/帧 |
++| `rejected quats` | 1–2% |
++| 第 2 步 | `obs[0..3]` / `obs[3..6]` / 关节块 **零失配** |
++
++---
++
++## 接入运行时
++
++`duck-control` 这一侧已经就绪；**`robotd` 这一侧还没写**。
++
++| 项 | 状态 |
++|---|---|
++| `DynamixelIo::open_without_bus_imu()` —— 不再请求 id 200 | ✅ |
++| `ExternalImuIo::new(joints, module, mount)` —— 合并成 `Sensors` | ✅ |
++| 配置项（总线路径 / mount / 源选择）| ⛔ 待写 `robotd-params` + `deploy/robotd.toml` |
++| `robotd` 按配置选构造路径 | ⛔ 现状固定调 `DynamixelIo::open` |
++| IMU 独立线程 + 共享槽 | ⛔ **`ExternalImuIo` 现在是同步读**，每 tick 约 1 ms |
++| 启动自检 | ⛔ 无板模式下 `imu_answers()` 恒返回 `false`，启动检查要跟着改 |
++
++代码结构：
++
++| 文件 | 作用 |
++|---|---|
++| `imu_icm42670p.rs` | 解码：模块寄存器 → `ImuData`（陀螺 ±2000 dps，四元数 float32 含 `w`）|
++| `imu_i2c.rs` | 传输：`RegisterBlocks` trait + 寄存器地图 + 总线扫描 |
++| `imu_external.rs` | 合并：`ExternalImuIo` |
++| `bus.rs` | `open_without_bus_imu()` |
++
++---
++
++## 标定 mount
++
++mount 是**模块坐标系 → 躯干坐标系**的旋转。没装在躯干上就无法定（没有参照物）。
++
++参考装法：模块三轴与躯干重合（**X 前 / Y 左 / Z 上**），物理上即**元件面朝上、Type-C 朝后**，此时 **mount = `[1, 0, 0, 0]`**。
++
++模块自身坐标系（实测，三个正交姿态）：
++
++| 姿态 | 重力（世界的"下"在模块系里）|
++|---|---|
++| 平放、元件面朝上 | `[0, 0, -1]` |
++| Type-C 朝上 | `[1, 0, 0]` |
++| 侧立、元件面朝右 | `[0, 1, 0]` |
++
++⇒ 平放时 **+X 背离 Type-C、+Y 指向右、+Z 朝上（元件面法线）**。
++
++`imu_mount` 采一个姿态会先静置 3 秒（丢弃）再取 5 秒平均，并给出 **spread**；超过 0.1 直接拒绝保存——**动过的姿态比没有姿态更糟，因为它看着像数据**。
++
++> ⚠️ 换装法必须重算 mount。**装歪 90° 时所有电气检查都会通过**，症状只是鸭子朝错误方向倒。
++
++---
++
++## 验收清单（装机后）
++
++| 检查 | 通过标准 |
++|---|---|
++| 站立姿态 | 重力 ≈ `[0, 0, -1]` |
++| 绕躯干 X 转 90° | ≈ `[0, ±1, 0]` |
++| 绕躯干 Y 转 90° | ≈ `[±1, 0, 0]` |
++| 陀螺方向 | 向右滚时 X 符号正确；低头时 Y 正确 |
++| 50 Hz 周期 | 不被 I²C 拖慢 |
++| 连续运行 | 0 次读失败 |
++
++**后两项轴向检查不能省**：重力对偏航是盲的，偏航错了会把横滚率和俯仰率对调，而所有电气检查都会通过。
++
++---
++
++## 已知行为（不是故障）
++
++| 现象 | 说明 |
++|---|---|
++| **每 100 次读约 1–2 次返回全零块** | 模块写融合结果前会清零，窗口约 80 µs。解码器用模长检查拦下并保持上一帧。**不要去掉这个检查**——否则全零四元数会被当成"机器人直立"。实测比例**与转速无关**（各档 1–3%）|
++| **静止时原始陀螺恰好为 0** | 静止门限，不是坏传感器。**阈值远低于机器人的任何运动**：真实转速 0.14 °/s 时已正常输出，0–0.5 °/s 档 97% 是活的——**慢速运动不会被削掉** |
++| **出厂就是 100 Hz** | 协议表写默认 25 Hz，实测 100 Hz。设置存在闪存里，换新模块要确认 |
++| **四元数模长约 0.998** | 模块内部就这么给，解码器会归一化 |
++| 开机第一拍是初始值 | 需两个先验；第二拍起准确。`ready()` 在 25 帧前为假 |
++
++---
++
++## 尚未验证
++
++| 项 | 为什么 |
++|---|---|
++| 总线从 16 个块变 15 个 | 需要接上 15 颗舵机的真总线 |
++| 运行时接线 | 未实现 |
++| **换 IMU 后策略是否还走得好** | 需要整机上机。IMU 的噪声与融合特性会改变观测分布，仿真未建模 |
++
++---
++
++## 回滚
++
++所有改动都在 `duck-control` 内，且总线侧保留原路径：用 `DynamixelIo::open()`（原样）即回到"IMU 挂在总线上"，不需要改其他代码。
++
++---
++
++## 验证记录
++
++| 项 | 值 | 环境 |
++|---|---|---|
++| 单元测试 | 111 passed | Windows + aarch64 |
++| 采样率 / 丢帧 | 99.4 Hz / 0 | Jetson Orin Nano + `/dev/i2c-7` |
++| 总线耗时 | 0.92 ms/帧（由计时推断 400 kHz）| 同上 |
++| 被拒四元数 | 1.3 / 1.7 / 1.8%（100 Hz）；0.10%（50 Hz）| 同上 |
++| 静止门限 | 0.14 °/s 时仍正常；0–0.5 °/s 档 97% 输出正常 | 同上，`imu_gate` 3975 样本 |
+diff --git a/duck-control/Cargo.toml b/duck-control/Cargo.toml
+index b53d572..40bc3b1 100644
+--- a/duck-control/Cargo.toml
++++ b/duck-control/Cargo.toml
+@@ -44,5 +44,18 @@ rustypot = "1.8.0"
+ # same reason; this crate has to as well, or cargo's feature unification turns it back on.
+ serialport = { version = "4.8", default-features = false }
+ 
++# The external IMU module (`src/imu_i2c.rs`) is reached through `/dev/i2c-*`, which exists on no
++# other platform — the same rule `tof` applies to the head IMU, and for the same reason:
++# `cargo test --workspace` has to run on a developer's machine. Off Linux this crate still
++# compiles the trait and the register map; only the bus is absent, and nothing pretends
++# otherwise.
++[target.'cfg(target_os = "linux")'.dependencies]
++# `I2cdev`, the `embedded-hal` bus this transport is written against.
++linux-embedded-hal = "0.4"
++# The `I2c` trait itself. `linux-embedded-hal` implements it; this crate has to name it to
++# write the one `RegisterBlocks` impl, and reaching it through a re-export would tie the
++# trait to whichever version that crate happens to re-export.
++embedded-hal = "1.0"
++
+ [dev-dependencies]
+ serde_json.workspace = true
+diff --git a/duck-control/examples/imu_gate.rs b/duck-control/examples/imu_gate.rs
+new file mode 100644
+index 0000000..f3e8af8
+--- /dev/null
++++ b/duck-control/examples/imu_gate.rs
+@@ -0,0 +1,258 @@
++//! Find the stillness gate: how slowly can the module turn before it stops reporting it.
++//!
++//! The module zeroes its **raw gyro** on all three axes while it believes it is still. That is
++//! harmless on a bench and potentially not harmless on a robot: an angular velocity of exactly
++//! zero is not noise, it is a dropped observation, and the policy's two IMU inputs are the gyro
++//! and projected gravity.
++//!
++//! The difficulty is that the gate destroys the measurement of its own threshold — a zeroed
++//! output says nothing about how fast the module was actually turning. So this measures the
++//! true rate **independently, from the fused quaternion**: differentiate it over time and the
++//! rotation is there whether or not the gyro reports it.
++//!
++//! Which also answers the second question. If the quaternion keeps tracking a slow turn while
++//! the gyro reads zero, the gate is on the *output* and the fusion still sees the motion. If
++//! the quaternion stops too, the motion is being lost before it is fused, and every slow
++//! movement the robot makes is invisible to the policy.
++//!
++//! ```text
++//! cargo run -p duck-control --example imu_gate -- /dev/i2c-7 40
++//! ```
++//!
++//! ## How to run it
++//!
++//! Start with the module still, then **turn it slowly** — as slowly as you can — and gradually
++//! increase the speed over the run, holding each speed for a second or two so the bins fill.
++//! Any axis will do. The interesting part of the table is where the "exactly zero" column
++//! changes, and the bins either side of it need samples to say anything.
++
++#[cfg(not(target_os = "linux"))]
++fn main() {
++    eprintln!("The IMU module is reached through /dev/i2c-*, which exists only on Linux.");
++    eprintln!("Run this on the robot, or on any Linux board with the module attached.");
++    std::process::exit(2);
++}
++
++#[cfg(target_os = "linux")]
++fn main() {
++    gate::run();
++}
++
++#[cfg(target_os = "linux")]
++mod gate {
++    use std::path::PathBuf;
++    use std::time::{Duration, Instant};
++
++    use duck_control::imu_i2c::{Icm42670pI2c, RegisterBlocks, open_first};
++    use duck_control::imu_icm42670p::Icm42670pDecoder;
++
++    const RATE_HZ: u64 = 100;
++    const PERIOD: Duration = Duration::from_micros(1_000_000 / RATE_HZ);
++    const PRINT_EVERY: u64 = 50;
++    const UNROTATED: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
++
++    /// Upper edges of the speed bins, in °/s. Dense where a threshold is likely to sit — a
++    /// stillness gate is about a few degrees per second, not about tens.
++    const EDGES: [f64; 7] = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
++
++    pub fn run() {
++        let mut bus: Option<PathBuf> = None;
++        let mut seconds = 40.0f64;
++        for arg in std::env::args().skip(1) {
++            match arg.parse::<f64>() {
++                Ok(secs) => seconds = secs,
++                Err(_) => bus = Some(PathBuf::from(arg)),
++            }
++        }
++
++        let module = match open_first(bus.as_deref()) {
++            Ok(module) => module,
++            Err(e) => {
++                eprintln!("no module: {e}");
++                std::process::exit(1);
++            }
++        };
++
++        println!("{RATE_HZ} Hz for {seconds:.0} s.");
++        println!("Still first, then turn it slowly and keep speeding up. The rate below is");
++        println!("measured from the quaternion, so it is independent of the gyro output.");
++        println!();
++
++        let report = drive(module, Duration::from_secs_f64(seconds));
++        report.print();
++    }
++
++    fn drive<B: RegisterBlocks>(mut module: Icm42670pI2c<B>, window: Duration) -> Report {
++        let mut decoder = Icm42670pDecoder::new(UNROTATED);
++        let mut report = Report::default();
++
++        let mut previous: Option<([f64; 4], Instant)> = None;
++        let deadline = Instant::now() + window;
++        while Instant::now() < deadline {
++            let tick = Instant::now();
++            let now = Instant::now();
++            match module.read_sample() {
++                Ok(sample) => {
++                    report.samples += 1;
++                    let imu = decoder.decode(&sample);
++                    let raw_zero = sample.gyro.iter().all(|&g| g == 0);
++
++                    // A repeated quaternion is either a genuine still moment or a sample the
++                    // decoder refused — in both cases the derivative is meaningless, and
++                    // counting it would stuff the slowest bin with intervals that were never
++                    // measured.
++                    if let Some((last_quat, last_at)) = previous {
++                        let dt = now.duration_since(last_at).as_secs_f64();
++                        if imu.quat != last_quat && dt > 0.0 {
++                            let rate =
++                                rates_between(last_quat, imu.quat).map(|w| magnitude(w) / dt);
++                            if let Some(rate) = rate {
++                                report.record(rate, raw_zero);
++                                if report.samples.is_multiple_of(PRINT_EVERY) {
++                                    println!(
++                                        "  raw gyro {:>6}   true rate {:>7.2} °/s",
++                                        if raw_zero { "zero" } else { "live" },
++                                        rate.to_degrees()
++                                    );
++                                }
++                            } else {
++                                report.derivative_failures += 1;
++                            }
++                        } else {
++                            report.skipped += 1;
++                        }
++                    } else {
++                        report.skipped += 1;
++                    }
++                    previous = Some((imu.quat, now));
++                }
++                Err(e) => {
++                    report.read_failures += 1;
++                    if report.read_failures <= 3 {
++                        eprintln!("read failed: {e}");
++                    }
++                }
++            }
++            let spent = tick.elapsed();
++            if spent < PERIOD {
++                std::thread::sleep(PERIOD - spent);
++            }
++        }
++        report
++    }
++
++    /// The body-frame angular velocity that carries `from` to `to`, in radians per second
++    /// *before* the elapsed time is divided out — so callers scale by their own `dt`.
++    ///
++    /// `q` and `−q` are the same rotation; taking the shorter arc keeps a derivative that
++    /// crosses that boundary from reading as a full turn.
++    fn rates_between(from: [f64; 4], to: [f64; 4]) -> Option<[f64; 3]> {
++        let dot: f64 = (0..4).map(|i| from[i] * to[i]).sum();
++        let sign = if dot < 0.0 { -1.0 } else { 1.0 };
++        let to = [to[0] * sign, to[1] * sign, to[2] * sign, to[3] * sign];
++
++        // dq = to · from⁻¹, the rotation from one to the other in the same frame.
++        let inv = [from[0], -from[1], -from[2], -from[3]];
++        let dq = [
++            to[0] * inv[0] - to[1] * inv[1] - to[2] * inv[2] - to[3] * inv[3],
++            to[0] * inv[1] + to[1] * inv[0] + to[2] * inv[3] - to[3] * inv[2],
++            to[0] * inv[2] - to[1] * inv[3] + to[2] * inv[0] + to[3] * inv[1],
++            to[0] * inv[3] + to[1] * inv[2] - to[2] * inv[1] + to[3] * inv[0],
++        ];
++
++        let axis = [dq[1], dq[2], dq[3]];
++        let sin_half = magnitude(axis);
++        if sin_half < 1e-12 {
++            return Some([0.0; 3]);
++        }
++        // 2·atan2(|v|, w): stable where acos(w) is not, and `w` is already ≥ 0 from the flip.
++        let angle = 2.0 * sin_half.atan2(dq[0]);
++        let scale = angle / sin_half;
++        Some([axis[0] * scale, axis[1] * scale, axis[2] * scale])
++    }
++
++    fn magnitude(v: [f64; 3]) -> f64 {
++        (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
++    }
++
++    #[derive(Default)]
++    struct Report {
++        samples: u64,
++        read_failures: u64,
++        skipped: u64,
++        derivative_failures: u64,
++        /// Per bin: (samples, samples whose raw gyro was exactly zero).
++        bins: [Option<(u64, u64)>; EDGES.len()],
++        /// The fastest true rate seen with a zeroed gyro, and the slowest seen live.
++        fastest_zero: f64,
++        slowest_live: Option<f64>,
++    }
++
++    impl Report {
++        fn record(&mut self, rate_rad: f64, raw_zero: bool) {
++            let dps = rate_rad.to_degrees();
++            // One bin per interval: the highest edge the rate clears. Filling every edge below
++            // it would make the table cumulative and hide exactly the transition it exists to
++            // show.
++            if let Some(index) = EDGES.iter().rposition(|&edge| dps >= edge) {
++                let (total, zero) = self.bins[index].get_or_insert((0, 0));
++                *total += 1;
++                if raw_zero {
++                    *zero += 1;
++                }
++            }
++            if raw_zero {
++                self.fastest_zero = self.fastest_zero.max(dps);
++            } else {
++                self.slowest_live = Some(match self.slowest_live {
++                    Some(v) => v.min(dps),
++                    None => dps,
++                });
++            }
++        }
++
++        fn print(&self) {
++            println!();
++            println!(
++                "samples {samples}, read failures {failures}",
++                samples = self.samples,
++                failures = self.read_failures
++            );
++            println!(
++                "intervals skipped {skipped} (repeated quaternion), derivative failures {failures}",
++                skipped = self.skipped,
++                failures = self.derivative_failures
++            );
++            println!();
++            println!("true rate bin, °/s      intervals   raw gyro exactly zero");
++            println!("------------------------------------------------------------");
++            for (index, &edge) in EDGES.iter().enumerate() {
++                let upper = EDGES.get(index + 1).copied();
++                let label = match upper {
++                    Some(u) => format!("{edge:.1} – {u:.1}"),
++                    None => format!("{edge:.1} and faster"),
++                };
++                match self.bins[index] {
++                    Some((total, zero)) => println!(
++                        "{label:<22} {total:>9}   {zero:>6}  ({:.0}%)",
++                        100.0 * zero as f64 / total as f64
++                    ),
++                    None => println!("{label:<22} {0:>9}   {0:>6}", 0),
++                }
++            }
++            println!();
++            println!(
++                "fastest turn with the gyro zeroed : {:.2} °/s",
++                self.fastest_zero
++            );
++            match self.slowest_live {
++                Some(v) => println!("slowest turn with the gyro live   : {:.2} °/s", v),
++                None => println!("slowest turn with the gyro live   : never — it never came alive"),
++            }
++            println!();
++            println!("If the zeroed column falls to 0% at a rate well above the module's noise,");
++            println!("that rate is the gate. If the quaternion followed the slow turns (the bins");
++            println!("filled at all), the gate is on the output and the fusion still saw them.");
++        }
++    }
++}
+diff --git a/duck-control/examples/imu_mount.rs b/duck-control/examples/imu_mount.rs
+new file mode 100644
+index 0000000..696b9ef
+--- /dev/null
++++ b/duck-control/examples/imu_mount.rs
+@@ -0,0 +1,359 @@
++//! Capture the module's attitude in poses the operator declares.
++//!
++//! ## What a mount is, and why this cannot be finished on a bare bench
++//!
++//! The mount is the rotation that carries the module's frame to the trunk's. It is a fact
++//! about **how the module is bolted to the trunk**, so it cannot be measured from the module
++//! alone: with no trunk there is nothing for the rotation to be relative to, and a bench run
++//! can only say what the module's own axes are.
++//!
++//! What this tool does now is the part that *is* available before the trunk exists — capture
++//! the module's frame cleanly, in whatever orientation the operator holds it, with a check
++//! that the module did not move during the window. Mounted later, the same capture in the
++//! robot's standing pose plus a declaration of which module axis points forward is the whole
++//! of the mount.
++//!
++//! ```text
++//! cargo run -p duck-control --example imu_mount                      # live, 2 Hz
++//! cargo run -p duck-control --example imu_mount -- --capture level   # average 5 s, save
++//! cargo run -p duck-control --example imu_mount -- /dev/i2c-7 --capture tilt-x --seconds 8
++//! ```
++//!
++//! ## Reading the live output
++//!
++//! ```text
++//! gravity   +0.016 -0.010 -1.000        |q| 1.0000
++//!             ^      ^      ^
++//!           module module module
++//!             X      Y      Z
++//! ```
++//!
++//! Gravity is the world's **down** expressed in the module's frame — `ImuData` documents
++//! upright as `[0, 0, -1]` — so the vector names the module axis that points down. Held flat
++//! with the component side up it reads near `+0.0 +0.0 −1.0`, meaning the module's `−Z` is
++//! down and its `+Z` is the component-side normal. Measured 2026-10-15.
++//!
++//! ## Why a capture is averaged rather than sampled once
++//!
++//! One sample carries the gyro's noise and the module's own fusion wobble. An average over a
++//! few seconds does not, and the deviation from that average is the number that says whether
++//! the operator's hand was steady enough for the result to mean anything — a capture that
++//! moved is worse than no capture, because it looks like data.
++
++#[cfg(not(target_os = "linux"))]
++fn main() {
++    eprintln!("The IMU module is reached through /dev/i2c-*, which exists only on Linux.");
++    eprintln!("Run this on the robot, or on any Linux board with the module attached.");
++    std::process::exit(2);
++}
++
++#[cfg(target_os = "linux")]
++fn main() {
++    mount::run();
++}
++
++#[cfg(target_os = "linux")]
++mod mount {
++    use std::io::Write as _;
++    use std::path::PathBuf;
++    use std::time::{Duration, Instant};
++
++    use duck_control::imu_i2c::{Icm42670pI2c, RegisterBlocks, open_first};
++    use duck_control::imu_icm42670p::{GYRO_RAD_PER_LSB, Icm42670pDecoder, Icm42670pSample};
++
++    /// Faster than the control loop, because a capture averages anyway and a pose the operator
++    /// is holding by hand drifts.
++    const RATE_HZ: u64 = 100;
++    const PERIOD: Duration = Duration::from_micros(1_000_000 / RATE_HZ);
++
++    /// Live readout cadence. A human is watching, not a log.
++    const PRINT_EVERY: u64 = 50;
++
++    const UNROTATED: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
++
++    /// A capture whose deviation from its own mean exceeds this moved, and is not a pose.
++    /// Sized from the module's own noise: a still module's gravity wanders by a few
++    /// thousandths, so a tenth is well clear of it and still catches a real movement.
++    const STEADY_TOLERANCE: f64 = 0.1;
++
++    pub fn run() {
++        let mut bus: Option<PathBuf> = None;
++        let mut label: Option<String> = None;
++        let mut seconds = 5.0f64;
++        let mut settle = 3.0f64;
++        let mut file: Option<PathBuf> = None;
++
++        let mut args = std::env::args().skip(1);
++        while let Some(arg) = args.next() {
++            match arg.as_str() {
++                "--capture" => {
++                    label = Some(
++                        args.next()
++                            .unwrap_or_else(|| die("--capture wants a label")),
++                    )
++                }
++                "--seconds" => {
++                    seconds = args
++                        .next()
++                        .and_then(|v| v.parse().ok())
++                        .unwrap_or_else(|| die("--seconds wants a number"));
++                }
++                "--settle" => {
++                    settle = args
++                        .next()
++                        .and_then(|v| v.parse().ok())
++                        .unwrap_or_else(|| die("--settle wants a number"));
++                }
++                "--file" => {
++                    file = Some(PathBuf::from(
++                        args.next().unwrap_or_else(|| die("--file wants a path")),
++                    ))
++                }
++                other => match other.parse::<f64>() {
++                    Ok(secs) => seconds = secs,
++                    Err(_) => bus = Some(PathBuf::from(other)),
++                },
++            }
++        }
++
++        let module = match open_first(bus.as_deref()) {
++            Ok(module) => module,
++            Err(e) => {
++                eprintln!("no module: {e}");
++                eprintln!(
++                    "checked: {}",
++                    duck_control::imu_i2c::BUS_CANDIDATES.join(", ")
++                );
++                std::process::exit(1);
++            }
++        };
++        let mut decoder = Icm42670pDecoder::new(UNROTATED);
++
++        match label {
++            Some(label) => capture(module, &mut decoder, &label, seconds, settle, file),
++            None => live(module, &mut decoder, seconds),
++        }
++    }
++
++    fn die(message: &str) -> ! {
++        eprintln!("{message}");
++        std::process::exit(2);
++    }
++
++    fn sample_or_warn<B: RegisterBlocks>(module: &mut Icm42670pI2c<B>) -> Option<Icm42670pSample> {
++        match module.read_sample() {
++            Ok(sample) => Some(sample),
++            Err(e) => {
++                eprintln!("read failed: {e}");
++                None
++            }
++        }
++    }
++
++    /// Show the attitude as it comes, so a human can watch the effect of moving the module.
++    fn live<B: RegisterBlocks>(
++        mut module: Icm42670pI2c<B>,
++        decoder: &mut Icm42670pDecoder,
++        seconds: f64,
++    ) {
++        println!("live, {RATE_HZ} Hz for {seconds:.0} s — module axes, no mount applied");
++        println!("gravity points up in the module's frame; |q| should sit near 1");
++        println!();
++
++        let deadline = Instant::now() + Duration::from_secs_f64(seconds);
++        let mut ticks = 0u64;
++        while Instant::now() < deadline {
++            let tick = Instant::now();
++            if let Some(sample) = sample_or_warn(&mut module) {
++                ticks += 1;
++                if ticks.is_multiple_of(PRINT_EVERY) {
++                    let imu = decoder.decode(&sample);
++                    let norm = imu.quat.iter().map(|c| c * c).sum::<f64>().sqrt();
++                    println!(
++                        "gravity   {:+.3} {:+.3} {:+.3}        |q| {norm:.4}   gyro {:+.2} {:+.2} {:+.2}",
++                        imu.gravity[0],
++                        imu.gravity[1],
++                        imu.gravity[2],
++                        sample.gyro[0] as f64 * GYRO_RAD_PER_LSB,
++                        sample.gyro[1] as f64 * GYRO_RAD_PER_LSB,
++                        sample.gyro[2] as f64 * GYRO_RAD_PER_LSB,
++                    );
++                }
++            }
++            pace(tick);
++        }
++    }
++
++    /// Average one pose and record it.
++    fn capture<B: RegisterBlocks>(
++        mut module: Icm42670pI2c<B>,
++        decoder: &mut Icm42670pDecoder,
++        label: &str,
++        seconds: f64,
++        settle: f64,
++        file: Option<PathBuf>,
++    ) {
++        println!(
++            "capturing '{label}': {settle:.0} s to get into position, then {seconds:.0} s held."
++        );
++        println!();
++
++        // The operator starts the run and only then has their hands where they want them — so
++        // the reach into the pose is discarded rather than averaged in. Without this, a capture
++        // taken while the module was still being placed reads as one that moved, which is
++        // indistinguishable from a hand that shook.
++        let deadline = Instant::now() + Duration::from_secs_f64(settle + seconds);
++        let settled_at = Instant::now() + Duration::from_secs_f64(settle);
++        let mut quats: Vec<[f64; 4]> = Vec::new();
++        let mut gravity: Vec<[f64; 3]> = Vec::new();
++        let mut failures = 0u64;
++
++        while Instant::now() < deadline {
++            let tick = Instant::now();
++            match module.read_sample() {
++                Ok(sample) => {
++                    // Decoded on every sample, including the settle, and only *recorded* after
++                    // it. Skipping the decode during the settle would leave the decoder's
++                    // histories cold, and its first output is then the initial state rather
++                    // than a measurement — one sample at right angles to the pose, which the
++                    // spread check reads as a hand that moved. It cost four captures to find,
++                    // and only because the pose held happened to differ from upright.
++                    let imu = decoder.decode(&sample);
++                    if Instant::now() >= settled_at {
++                        quats.push(imu.quat);
++                        gravity.push(imu.gravity);
++                    }
++                }
++                Err(e) => {
++                    failures += 1;
++                    if failures <= 3 {
++                        eprintln!("read failed: {e}");
++                    }
++                }
++            }
++            pace(tick);
++        }
++
++        if gravity.len() < 10 {
++            die("too few samples to average — is the module answering?");
++        }
++
++        let mean_quat = mean_quaternion(&quats);
++        let mean_gravity = mean_vector(&gravity);
++        let spread = gravity
++            .iter()
++            .map(|g| distance(*g, mean_gravity))
++            .fold(0.0f64, f64::max);
++        let norm = mean_quat.iter().map(|c| c * c).sum::<f64>().sqrt();
++
++        println!(
++            "captured '{label}': {} samples over {seconds:.0} s, {failures} read failures",
++            gravity.len()
++        );
++        println!(
++            "  quaternion  w {:+.4}  x {:+.4}  y {:+.4}  z {:+.4}   |q| {norm:.4}",
++            mean_quat[0], mean_quat[1], mean_quat[2], mean_quat[3]
++        );
++        println!(
++            "  gravity     {:+.4} {:+.4} {:+.4}",
++            mean_gravity[0], mean_gravity[1], mean_gravity[2]
++        );
++        println!("  spread      {spread:.4}  (max deviation over the window)");
++
++        if spread > STEADY_TOLERANCE {
++            println!();
++            println!("  !! the module moved during the window — this is not one pose.");
++            println!("     Nothing was saved: a pose that moved is worse than no pose, because");
++            println!("     it looks like data and a solver downstream cannot tell.");
++            println!("     Hold it still and run the same capture again.");
++            std::process::exit(1);
++        }
++
++        let path = file.unwrap_or_else(default_capture_file);
++        match append_capture(&path, label, mean_quat, mean_gravity, spread) {
++            Ok(()) => println!("  appended to {}", path.display()),
++            Err(e) => {
++                eprintln!("  could not write {}: {e}", path.display());
++                std::process::exit(1);
++            }
++        }
++
++        println!();
++        println!("The mount still needs a trunk. Mounted, capture the robot's standing pose as");
++        println!("'level' and declare which module axis points forward; that plus the robot");
++        println!("rotated 90° about each trunk axis is the whole of it.");
++    }
++
++    fn default_capture_file() -> PathBuf {
++        match std::env::var_os("HOME") {
++            Some(home) => PathBuf::from(home).join("imu-mount.txt"),
++            None => PathBuf::from("imu-mount.txt"),
++        }
++    }
++
++    /// One line per capture, human-readable and easy to hand-edit. Not a format anything
++    /// parses yet — a solver that reads it will pin it then, and until there is a trunk there
++    /// is nothing to solve.
++    fn append_capture(
++        path: &PathBuf,
++        label: &str,
++        quat: [f64; 4],
++        gravity: [f64; 3],
++        spread: f64,
++    ) -> std::io::Result<()> {
++        let mut file = std::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(path)?;
++        writeln!(
++            file,
++            "{label}\tquat {:.6} {:.6} {:.6} {:.6}\tgravity {:.6} {:.6} {:.6}\tspread {spread:.6}",
++            quat[0], quat[1], quat[2], quat[3], gravity[0], gravity[1], gravity[2]
++        )
++    }
++
++    /// Averaged with the sign ambiguity removed.
++    ///
++    /// `q` and `−q` are the same rotation, so a module sitting exactly on the boundary between
++    /// them would average to zero — and the boundary is not exotic, it is wherever the fused
++    /// yaw happens to cross. Each sample is therefore flipped into the first sample's
++    /// hemisphere before it is summed.
++    fn mean_quaternion(samples: &[[f64; 4]]) -> [f64; 4] {
++        let reference = samples[0];
++        let mut sum = [0.0f64; 4];
++        for q in samples {
++            let dot: f64 = (0..4).map(|i| q[i] * reference[i]).sum();
++            let sign = if dot < 0.0 { -1.0 } else { 1.0 };
++            for i in 0..4 {
++                sum[i] += sign * q[i];
++            }
++        }
++        let norm = sum.iter().map(|c| c * c).sum::<f64>().sqrt();
++        if norm <= 0.0 {
++            return reference;
++        }
++        [sum[0] / norm, sum[1] / norm, sum[2] / norm, sum[3] / norm]
++    }
++
++    fn mean_vector(samples: &[[f64; 3]]) -> [f64; 3] {
++        let mut sum = [0.0f64; 3];
++        for v in samples {
++            for i in 0..3 {
++                sum[i] += v[i];
++            }
++        }
++        let n = samples.len() as f64;
++        [sum[0] / n, sum[1] / n, sum[2] / n]
++    }
++
++    fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
++        (0..3).map(|i| (a[i] - b[i]).powi(2)).sum::<f64>().sqrt()
++    }
++
++    fn pace(tick: Instant) {
++        let spent = tick.elapsed();
++        if spent < PERIOD {
++            std::thread::sleep(PERIOD - spent);
++        }
++    }
++}
+diff --git a/duck-control/examples/imu_probe.rs b/duck-control/examples/imu_probe.rs
+new file mode 100644
+index 0000000..c3b7861
+--- /dev/null
++++ b/duck-control/examples/imu_probe.rs
+@@ -0,0 +1,258 @@
++//! Read the external IMU module off its I²C bus and report whether it is fit to run a robot.
++//!
++//! This is the bench tool for the swap, and the only step that needs hardware at all — and it
++//! needs *only* the module. No servos, no assembled robot. Run it before wiring anything else.
++//!
++//! ```text
++//! cargo run -p duck-control --example imu_probe             # find the module, read for 20 s
++//! cargo run -p duck-control --example imu_probe -- /dev/i2c-3 30
++//! ```
++//!
++//! It answers, in the order that would stop you:
++//!
++//! * does the module answer, and on which bus
++//! * is it producing samples at the rate the control loop needs — 50 Hz, and the module does 100
++//! * are the samples *new*. A module repeating one frame looks fast and is not, which is why
++//!   the new-value rate is reported next to the sample rate rather than instead of it
++//! * does the decoded attitude make sense: gravity is a unit vector near −Z when the module is
++//!   level, and the gyro sits near zero when it is still — except that this module's stillness
++//!   gate zeroes it *exactly*, which is a property, not a fault
++//! * what a sample costs on the bus, which is the number that decides whether this can share a
++//!   tick with the servos
++//!
++//! It does **not** calibrate the mount, and cannot: the mount is a fact about how the module is
++//! bolted to the trunk, not about the bus. Until that is measured this reports attitude in the
++//! module's own axes, so a level module need not read as level.
++
++#[cfg(not(target_os = "linux"))]
++fn main() {
++    eprintln!("The IMU module is reached through /dev/i2c-*, which exists only on Linux.");
++    eprintln!("Run this on the robot, or on any Linux board with the module attached.");
++    std::process::exit(2);
++}
++
++#[cfg(target_os = "linux")]
++fn main() {
++    probe::run();
++}
++
++#[cfg(target_os = "linux")]
++mod probe {
++    use std::path::PathBuf;
++    use std::time::{Duration, Instant};
++
++    use duck_control::imu_i2c::{ADDRESS, Icm42670pI2c, RegisterBlocks, open_first};
++    use duck_control::imu_icm42670p::{GYRO_RAD_PER_LSB, Icm42670pDecoder, Icm42670pSample};
++
++    /// The module fuses at 100 Hz; pacing the reads to that is what the robot will do, so the
++    /// probe measures the same thing the robot will live with rather than hammering the bus.
++    const RATE_HZ: u64 = 100;
++    const PERIOD: Duration = Duration::from_micros(1_000_000 / RATE_HZ);
++
++    /// Without a mount there is no rotation to apply, and inventing one would make the report
++    /// agree with a robot that does not exist.
++    const UNROTATED: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
++
++    pub fn run() {
++        let mut bus: Option<PathBuf> = None;
++        let mut seconds = 20.0f64;
++        for arg in std::env::args().skip(1) {
++            match arg.parse::<f64>() {
++                Ok(secs) => seconds = secs,
++                Err(_) => bus = Some(PathBuf::from(arg)),
++            }
++        }
++
++        let module = match open_first(bus.as_deref()) {
++            Ok(module) => module,
++            Err(e) => {
++                eprintln!("no module: {e}");
++                eprintln!(
++                    "checked: {}",
++                    duck_control::imu_i2c::BUS_CANDIDATES.join(", ")
++                );
++                eprintln!();
++                eprintln!("Find the bus rather than guessing it — the numbering is per board:");
++                eprintln!(
++                    "  i2cdetect -l                 which buses exist, and what they are called"
++                );
++                eprintln!("  sudo i2cdetect -y -r N       should show {ADDRESS:#04x}");
++                eprintln!("then name it:");
++                eprintln!("  cargo run -p duck-control --example imu_probe -- /dev/i2c-N 20");
++                eprintln!();
++                eprintln!("Opening /dev/i2c-* needs root or the `i2c` group, and the bus only");
++                eprintln!(
++                    "exists once I²C is enabled — raspi-config on a Pi, jetson-io on a Jetson."
++                );
++                std::process::exit(1);
++            }
++        };
++
++        println!("reading for {seconds:.0} s at {RATE_HZ} Hz...");
++        let report = measure(module, Duration::from_secs_f64(seconds));
++        report.print();
++        if !report.passes() {
++            std::process::exit(1);
++        }
++    }
++
++    struct Report {
++        seconds: f64,
++        samples: u64,
++        fresh: u64,
++        failures: u64,
++        rejected: u64,
++        bus_nanos: u128,
++        ready_after: Option<u64>,
++        last: Option<(Icm42670pSample, f64, [f64; 3])>,
++    }
++
++    impl Report {
++        fn sample_hz(&self) -> f64 {
++            self.samples as f64 / self.seconds
++        }
++
++        /// How often the whole frame changed, which is not the same as how often the module
++        /// produced something. Gyro noise makes every frame differ, so this sits at 100% by
++        /// construction and only moves when a frame is frozen *entire* — the failure it is here
++        /// to catch. Whether the quaternions inside those frames are usable is
++        /// [`Self::rejected`]'s question, and this number cannot answer it.
++        fn fresh_hz(&self) -> f64 {
++            self.fresh as f64 / self.seconds
++        }
++
++        /// What one sample costs on the bus — the share of a 20 ms tick it would claim.
++        fn bus_ms(&self) -> f64 {
++            if self.samples == 0 {
++                return 0.0;
++            }
++            self.bus_nanos as f64 / self.samples as f64 / 1e6
++        }
++
++        fn passes(&self) -> bool {
++            self.failures == 0 && self.fresh_hz() >= 45.0 && self.ready_after.is_some()
++        }
++
++        fn print(&self) {
++            println!();
++            println!(
++                "samples        {:>6}   {:.1} Hz",
++                self.samples,
++                self.sample_hz()
++            );
++            println!(
++                "frame changes  {:>6}   {:.1} Hz   (catches a frozen frame, nothing subtler)",
++                self.fresh,
++                self.fresh_hz()
++            );
++            println!("read failures  {:>6}", self.failures);
++            println!(
++                "rejected quats {:>6}{}",
++                self.rejected,
++                if self.rejected == 0 {
++                    String::new()
++                } else {
++                    format!(
++                        "   <- {:.2}% of samples held the previous attitude",
++                        100.0 * self.rejected as f64 / self.samples.max(1) as f64
++                    )
++                }
++            );
++            println!("bus time       {:>6.2} ms per sample", self.bus_ms());
++            match self.ready_after {
++                Some(n) => println!("ready after    {n:>6} samples"),
++                None => {
++                    println!("ready after         -   the module never produced 25 quaternions")
++                }
++            }
++            if let Some((raw, norm, gravity)) = self.last {
++                println!();
++                println!(
++                    "last gyro      {:+.3} {:+.3} {:+.3} rad/s   (module axes, unrotated)",
++                    raw.gyro[0] as f64 * GYRO_RAD_PER_LSB,
++                    raw.gyro[1] as f64 * GYRO_RAD_PER_LSB,
++                    raw.gyro[2] as f64 * GYRO_RAD_PER_LSB,
++                );
++                println!(
++                    "last gravity   {:+.3} {:+.3} {:+.3}   |q| = {norm:.4}",
++                    gravity[0], gravity[1], gravity[2]
++                );
++            }
++
++            println!();
++            if self.passes() {
++                println!("PASS — the module is fit to wire into robotd.");
++                println!(
++                    "Next: measure the mount. Three poses (level, +90° about X, +90° about Y),"
++                );
++                println!("and the quaternion that carries one to the other is the mount constant.");
++            } else if self.fresh_hz() < 45.0 {
++                println!("FAIL — the module is repeating whole frames.");
++                println!(
++                    "A frozen frame is what a module whose output rate was never raised looks"
++                );
++                println!("like from here: set it over the serial link and measure again.");
++            } else if self.failures > 0 {
++                println!(
++                    "FAIL — the bus dropped reads. Check wiring and pull-ups before anything else."
++                );
++            } else {
++                println!("FAIL — the module never produced a usable quaternion.");
++            }
++        }
++    }
++
++    fn measure<B: RegisterBlocks>(mut module: Icm42670pI2c<B>, window: Duration) -> Report {
++        let mut decoder = Icm42670pDecoder::new(UNROTATED);
++        let mut report = Report {
++            seconds: 0.0,
++            samples: 0,
++            fresh: 0,
++            failures: 0,
++            rejected: 0,
++            bus_nanos: 0,
++            ready_after: None,
++            last: None,
++        };
++        let mut previous: Option<Icm42670pSample> = None;
++
++        let start = Instant::now();
++        let deadline = start + window;
++        while Instant::now() < deadline {
++            let tick = Instant::now();
++            match module.read_sample() {
++                Ok(sample) => {
++                    report.bus_nanos += tick.elapsed().as_nanos();
++                    report.samples += 1;
++                    if previous != Some(sample) {
++                        report.fresh += 1;
++                    }
++                    previous = Some(sample);
++                    let decoded = decoder.decode(&sample);
++                    if report.ready_after.is_none() && decoder.ready() {
++                        report.ready_after = Some(report.samples);
++                    }
++                    let norm = decoded.quat.iter().map(|c| c * c).sum::<f64>().sqrt();
++                    report.last = Some((sample, norm, decoded.gravity));
++                }
++                Err(e) => {
++                    report.failures += 1;
++                    // Say it the first few times and then stop: a module that is unplugged
++                    // would otherwise fill the terminal with the same line.
++                    if report.failures <= 3 {
++                        eprintln!("read failed: {e}");
++                    }
++                }
++            }
++            let spent = tick.elapsed();
++            if spent < PERIOD {
++                std::thread::sleep(PERIOD - spent);
++            }
++        }
++        report.seconds = start.elapsed().as_secs_f64();
++        // Every successful read was decoded once, so the gap between the reads and the
++        // quaternions the decoder kept is exactly the ones it refused.
++        report.rejected = report.samples - u64::from(decoder.quat_samples());
++        report
++    }
++}
+diff --git a/duck-control/examples/imu_to_observation.rs b/duck-control/examples/imu_to_observation.rs
+new file mode 100644
+index 0000000..3e8191e
+--- /dev/null
++++ b/duck-control/examples/imu_to_observation.rs
+@@ -0,0 +1,368 @@
++//! Drive the real IMU through the [`RobotIo`] seam and out the other side as the policy's
++//! observation.
++//!
++//! This is the third step's instrument. The transport is already proven on its own by
++//! `imu_probe`; what that cannot say is whether the six numbers the policy takes from the IMU
++//! arrive in the right slots. `obs.rs` calls itself "the highest-risk code in the crate"
++//! because a wrong index does not fail loudly — it produces a plausible robot that falls over.
++//! So this reads the real module every tick, builds the real observation through the real
++//! entry point, and checks the two things that would be silently wrong:
++//!
++//! * **`obs[0..3]` is the gyro and `obs[3..6]` is the projected gravity**, compared against
++//!   the `ImuData` that went in. Anything else and the policy is being lied to.
++//! * **the joint blocks are zero**, because the fake joints report the home pose and the
++//!   policy sees positions *relative* to it. A non-zero here means the home pose and the
++//!   backend disagree, which is a constant offset on fourteen slots.
++//!
++//! ```text
++//! cargo run -p duck-control --example imu_to_observation             # find the module, 20 s
++//! cargo run -p duck-control --example imu_to_observation -- /dev/i2c-7 60
++//! ```
++//!
++//! ## What this does not prove
++//!
++//! The joints are fake, so nothing here says anything about the servo bus, and the mount is
++//! uncalibrated, so the attitude is in the module's own axes rather than the trunk's. Both are
++//! stated in the output rather than left to be discovered. What it does prove is that a real
++//! IMU survives the whole path from `/dev/i2c-*` to the exact slots the policy reads — which
++//! leaves only the bus half for the day the servos arrive.
++//!
++//! ## What the bench backend is not
++//!
++//! `slow_sensors` reports zeros. There are no servos to ask, and the trait has no way to say
++//! "not measured" — only `measures_velocity` and `measures_load` carry that distinction, and
++//! a supply voltage has no equivalent. A consumer watching the battery would read 0 V, which
++//! is exactly what this is: a bench, not a robot.
++
++#[cfg(not(target_os = "linux"))]
++fn main() {
++    eprintln!("The IMU module is reached through /dev/i2c-*, which exists only on Linux.");
++    eprintln!("Run this on the robot, or on any Linux board with the module attached.");
++    std::process::exit(2);
++}
++
++#[cfg(target_os = "linux")]
++fn main() {
++    bench::run();
++}
++
++#[cfg(target_os = "linux")]
++mod bench {
++    use std::path::PathBuf;
++    use std::time::{Duration, Instant};
++
++    use duck_control::imu_i2c::{Icm42670pI2c, RegisterBlocks, open_first};
++    use duck_control::imu_icm42670p::Icm42670pDecoder;
++    use duck_control::io::{IoError, JointTargets, RobotIo, Sensors, SlowSensors};
++    use duck_control::{ACTION_LEN, Command, DEFAULT_POSITION, NUM_JOINTS, Observation};
++
++    /// The control loop's rate, so the tick budget this exercises is the robot's.
++    const RATE_HZ: u64 = 50;
++    const PERIOD: Duration = Duration::from_micros(1_000_000 / RATE_HZ);
++
++    /// Print this often. At 50 Hz a line per tick buries the reading that matters.
++    const PRINT_EVERY: u64 = 25;
++
++    /// Without a mount there is no rotation to apply, and inventing one would make the output
++    /// agree with a robot that does not exist.
++    const UNROTATED: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
++
++    pub fn run() {
++        let mut bus: Option<PathBuf> = None;
++        let mut seconds = 20.0f64;
++        for arg in std::env::args().skip(1) {
++            match arg.parse::<f64>() {
++                Ok(secs) => seconds = secs,
++                Err(_) => bus = Some(PathBuf::from(arg)),
++            }
++        }
++
++        let module = match open_first(bus.as_deref()) {
++            Ok(module) => module,
++            Err(e) => {
++                eprintln!("no module: {e}");
++                eprintln!(
++                    "checked: {}",
++                    duck_control::imu_i2c::BUS_CANDIDATES.join(", ")
++                );
++                eprintln!("`i2cdetect -l` lists the buses; pass the one the module is on.");
++                std::process::exit(1);
++            }
++        };
++
++        println!(
++            "{} Hz for {seconds:.0} s — fake joints at the home pose, real IMU, uncalibrated mount",
++            RATE_HZ
++        );
++        println!("attitude below is in the module's own axes until the mount is measured.");
++        println!();
++
++        let io = ImuOnlyIo::new(module, UNROTATED);
++        let report = drive(io, Duration::from_secs_f64(seconds));
++        report.print();
++        if !report.passed() {
++            std::process::exit(1);
++        }
++    }
++
++    /// Servos that hold the home pose and a real IMU.
++    ///
++    /// Generic over the register transport rather than over `/dev/i2c-*`, so the joint half and
++    /// the wiring to [`Sensors`] can be exercised with a fake bus — the same split that lets
++    /// the decode be tested without a module.
++    struct ImuOnlyIo<B: RegisterBlocks> {
++        module: Icm42670pI2c<B>,
++        decoder: Icm42670pDecoder,
++        /// Where the fake joints are held. The observation subtracts the home pose from this,
++        /// so holding it *at* home is what makes the joint blocks zero.
++        pose: [f64; NUM_JOINTS],
++    }
++
++    impl<B: RegisterBlocks> ImuOnlyIo<B> {
++        fn new(module: Icm42670pI2c<B>, mount: [f64; 4]) -> Self {
++            Self {
++                module,
++                decoder: Icm42670pDecoder::new(mount),
++                pose: DEFAULT_POSITION,
++            }
++        }
++    }
++
++    impl<B: RegisterBlocks> RobotIo for ImuOnlyIo<B> {
++        fn read(&mut self) -> duck_control::io::Result<Sensors> {
++            let sample = self
++                .module
++                .read_sample()
++                .map_err(|e| IoError::Bus(format!("imu: {e}")))?;
++            Ok(Sensors {
++                positions: self.pose,
++                velocities: [0.0; NUM_JOINTS],
++                currents_ma: [0.0; NUM_JOINTS],
++                imu: self.decoder.decode(&sample),
++            })
++        }
++
++        // A bench has nothing to drive. Each of these says so rather than pretending.
++        fn write(&mut self, _targets: &JointTargets) -> duck_control::io::Result<()> {
++            Ok(())
++        }
++        fn set_gain(&mut self, _kp: u16) -> duck_control::io::Result<()> {
++            Ok(())
++        }
++        fn set_torque(&mut self, _on: bool) -> duck_control::io::Result<()> {
++            Ok(())
++        }
++        fn reboot(&mut self, _id: u8) -> duck_control::io::Result<()> {
++            Ok(())
++        }
++        fn slow_sensors(&mut self) -> duck_control::io::Result<SlowSensors> {
++            Ok(SlowSensors {
++                volts: 0.0,
++                temps_c: [0.0; NUM_JOINTS],
++            })
++        }
++
++        // The two declarations that stop zeros being read as measurements: these joints are
++        // not moving and nothing is measuring their current, and saying so is the difference
++        // between "still" and "unmeasured".
++        fn measures_velocity(&self) -> bool {
++            false
++        }
++        fn measures_load(&self) -> bool {
++            false
++        }
++
++        fn imu_ready(&self) -> bool {
++            self.decoder.ready()
++        }
++    }
++
++    struct Report {
++        seconds: f64,
++        ticks: u64,
++        read_failures: u64,
++        stale_ticks: u64,
++        bad_gyro: u64,
++        bad_gravity: u64,
++        bad_joints: u64,
++        ready_after: Option<u64>,
++        last_gyro: [f64; 3],
++        last_gravity: [f64; 3],
++        last_norm: f64,
++    }
++
++    impl Report {
++        fn passed(&self) -> bool {
++            // Nothing is allowed to be wrong that the robot would not notice. A rejection is
++            // not a failure — the decoder is supposed to hold through one — but a wrong slot
++            // or a non-zero joint block is exactly the silent corruption this run exists to
++            // catch, so one of those is a red result however few there are.
++            self.ticks > 0
++                && self.read_failures == 0
++                && self.bad_gyro == 0
++                && self.bad_gravity == 0
++                && self.bad_joints == 0
++                && self.ready_after.is_some()
++        }
++
++        fn print(&self) {
++            println!();
++            println!(
++                "ticks          {:>6}   {:.1} Hz",
++                self.ticks,
++                self.ticks as f64 / self.seconds
++            );
++            println!("read failures  {:>6}", self.read_failures);
++            println!(
++                "stale ticks    {:>6}{}",
++                self.stale_ticks,
++                if self.stale_ticks == 0 {
++                    String::new()
++                } else {
++                    format!(
++                        "   ({:.2}% held the previous attitude)",
++                        100.0 * self.stale_ticks as f64 / self.ticks.max(1) as f64
++                    )
++                }
++            );
++            println!(
++                "last gyro      {:+.3} {:+.3} {:+.3} rad/s   (module axes, unrotated)",
++                self.last_gyro[0], self.last_gyro[1], self.last_gyro[2]
++            );
++            println!(
++                "last gravity   {:+.3} {:+.3} {:+.3}   |q| = {:.4}",
++                self.last_gravity[0], self.last_gravity[1], self.last_gravity[2], self.last_norm
++            );
++            match self.ready_after {
++                Some(n) => println!("ready after    {n:>6} ticks"),
++                None => println!("ready after         -   never converged"),
++            }
++
++            println!();
++            println!("observation slot checks");
++            println!("  obs[0..3]   gyro        {} mismatch(es)", self.bad_gyro);
++            println!(
++                "  obs[3..6]   gravity     {} mismatch(es)",
++                self.bad_gravity
++            );
++            println!(
++                "  obs[6..34]  joints      {} non-zero (want 0)",
++                self.bad_joints
++            );
++
++            println!();
++            if self.passed() {
++                println!("PASS — a real IMU reaches the policy's slots intact.");
++                println!("Only the servo bus is left unproven, and it is not on this bench.");
++            } else if self.bad_gyro > 0 || self.bad_gravity > 0 {
++                println!("FAIL — the observation disagrees with the IMU. The layout is wrong;");
++                println!("       do not trust anything downstream of it.");
++            } else if self.bad_joints > 0 {
++                println!("FAIL — the joint block is not zero though the joints are at home.");
++            } else if self.read_failures > 0 {
++                println!("FAIL — the bus dropped reads.");
++            } else {
++                println!("FAIL — the orientation never converged.");
++            }
++        }
++    }
++
++    fn drive<B: RegisterBlocks>(mut io: ImuOnlyIo<B>, window: Duration) -> Report {
++        let mut report = Report {
++            seconds: 0.0,
++            ticks: 0,
++            read_failures: 0,
++            stale_ticks: 0,
++            bad_gyro: 0,
++            bad_gravity: 0,
++            bad_joints: 0,
++            ready_after: None,
++            last_gyro: [0.0; 3],
++            last_gravity: [0.0; 3],
++            last_norm: 0.0,
++        };
++
++        // A still robot is told to stand, which is the command a bench can justify: no twist,
++        // no head, nominal stance.
++        let command = Command::default();
++        let last_action = [0.0f32; ACTION_LEN];
++        let mut previous_quat = None;
++
++        let start = Instant::now();
++        let deadline = start + window;
++        while Instant::now() < deadline {
++            let tick = Instant::now();
++
++            let sensors = match io.read() {
++                Ok(sensors) => sensors,
++                Err(e) => {
++                    report.read_failures += 1;
++                    if report.read_failures <= 3 {
++                        eprintln!("read failed: {e}");
++                    }
++                    std::thread::sleep(PERIOD);
++                    continue;
++                }
++            };
++            report.ticks += 1;
++
++            // A held attitude is the decoder doing its job, but it is worth counting: it is the
++            // one degradation the loop above cannot see, because a stale orientation looks
++            // exactly like a still robot.
++            if previous_quat == Some(sensors.imu.quat) {
++                report.stale_ticks += 1;
++            }
++            previous_quat = Some(sensors.imu.quat);
++
++            let observation = Observation::build(
++                &sensors.imu,
++                &sensors.positions,
++                &sensors.velocities,
++                &DEFAULT_POSITION,
++                &last_action,
++                &command,
++            );
++            let slots = observation.as_slice();
++
++            // The two checks this example exists for. Tolerances are f32-sized: the
++            // observation is `[f32; 61]` and the IMU is f64, so the round trip is lossy by
++            // design and comparing exactly would fail on every tick.
++            for i in 0..3 {
++                if (f64::from(slots[i]) - sensors.imu.gyro[i]).abs() > 1e-6 {
++                    report.bad_gyro += 1;
++                }
++                if (f64::from(slots[3 + i]) - sensors.imu.gravity[i]).abs() > 1e-6 {
++                    report.bad_gravity += 1;
++                }
++            }
++            if slots[6..34].iter().any(|v| v.abs() > 1e-6) {
++                report.bad_joints += 1;
++            }
++
++            report.last_gyro = sensors.imu.gyro;
++            report.last_gravity = sensors.imu.gravity;
++            report.last_norm = sensors.imu.quat.iter().map(|c| c * c).sum::<f64>().sqrt();
++
++            if report.ready_after.is_none() && io.imu_ready() {
++                report.ready_after = Some(report.ticks);
++            }
++
++            if report.ticks.is_multiple_of(PRINT_EVERY) {
++                println!(
++                    "tick {:>5}  gyro [{:+.3} {:+.3} {:+.3}]  gravity [{:+.3} {:+.3} {:+.3}]",
++                    report.ticks, slots[0], slots[1], slots[2], slots[3], slots[4], slots[5],
++                );
++            }
++
++            // The policy's own output fed back. On a bench nothing drives it, so it stays
++            // zero — but the observation is built through the real entry point rather than a
++            // shortened copy of it, which is the whole reason this exists.
++            let spent = tick.elapsed();
++            if spent < PERIOD {
++                std::thread::sleep(PERIOD - spent);
++            }
++        }
++        report.seconds = start.elapsed().as_secs_f64();
++        report
++    }
++}
+diff --git a/duck-control/src/bus.rs b/duck-control/src/bus.rs
+index da13fa7..e8c1ac6 100644
+--- a/duck-control/src/bus.rs
++++ b/duck-control/src/bus.rs
+@@ -118,11 +118,20 @@ pub struct DynamixelIo {
+     /// handle outright and offers no way to change its speed in place.
+     port: String,
+     /// IMU first, then the servos in [`JOINT_IDS`] order — the order blocks come back in.
++    /// Without the board's id when the IMU lives elsewhere; see [`Self::ids_for`].
+     ids: Vec<u8>,
++    /// Whether slot 0 of [`ids`](Self::ids) is the `imu_to_dxl` board.
++    ///
++    /// The alternative is an IMU the servo bus knows nothing about — a module on I²C, read by
++    /// [`crate::imu_external::ExternalImuIo`]. A field rather than an inference from `ids[0]`:
++    /// an id comparison would be right today and silently wrong the day a servo is given id
++    /// 200, and that failure reads a joint's block as an orientation.
++    imu_on_bus: bool,
+     /// Kept for the same reason as `port`: [`Self::reopen`] builds a new controller, and one
+     /// built without this would silently drop back to a plain sync read for the rest of the
+     /// process — a motor swap quietly halving the tick's bus budget.
+     fast_sync_read: bool,
++    /// Only meaningful when [`Self::imu_on_bus`]; left fresh and unused otherwise.
+     imu: SflpDecoder,
+     /// Blocks identical to their predecessor. The read succeeded but the board handed back
+     /// the same sample, which means the policy is being fed dead orientation data — a
+@@ -133,23 +142,53 @@ pub struct DynamixelIo {
+ impl DynamixelIo {
+     /// Open the bus. `fast_sync_read` is `bus.fast_sync_read` from `robotd.toml` — see
+     /// [`open_controller`] for what it costs to have wrong.
++    ///
++    /// This is the robot with the IMU on the bus, which is every robot until one is built
++    /// around an external module.
+     pub fn open(port: &str, fast_sync_read: bool) -> Result<Self> {
+-        let controller = open_controller(port, BAUD_RATE, fast_sync_read)?;
++        Self::open_with(port, fast_sync_read, true)
++    }
+ 
+-        let mut ids = Vec::with_capacity(NUM_JOINTS + 1);
+-        ids.push(IMU_DXL_ID);
+-        ids.extend_from_slice(&JOINT_IDS);
++    /// Open the bus for a robot whose IMU is **not** on it.
++    ///
++    /// Nothing is requested at [`IMU_DXL_ID`], so fifteen servos are read as fifteen blocks
++    /// rather than sixteen. [`RobotIo::read`] then reports
++    /// [`crate::imu::ImuData::default`] — which is not a claim that the robot is upright:
++    /// [`RobotIo::imu_ready`] stays false, and that distinction is the only thing the
++    /// observation layer is allowed to trust until something real supplies the sample. Pair
++    /// this with [`crate::imu_external::ExternalImuIo`], which does.
++    pub fn open_without_bus_imu(port: &str, fast_sync_read: bool) -> Result<Self> {
++        Self::open_with(port, fast_sync_read, false)
++    }
++
++    fn open_with(port: &str, fast_sync_read: bool, imu_on_bus: bool) -> Result<Self> {
++        let controller = open_controller(port, BAUD_RATE, fast_sync_read)?;
+ 
+         Ok(Self {
+             controller,
+             port: port.to_owned(),
+-            ids,
++            ids: Self::ids_for(imu_on_bus),
++            imu_on_bus,
+             fast_sync_read,
+             imu: SflpDecoder::default(),
+             stale_imu: StaleImuTracker::default(),
+         })
+     }
+ 
++    /// The id list one `sync_read` asks for, in the order its blocks come back.
++    ///
++    /// Pure, so the layout can be asserted without a serial port. The order is the whole
++    /// contract between this and [`RobotIo::read`], and getting it wrong reads a servo's
++    /// goal position as a quaternion.
++    fn ids_for(imu_on_bus: bool) -> Vec<u8> {
++        let mut ids = Vec::with_capacity(NUM_JOINTS + usize::from(imu_on_bus));
++        if imu_on_bus {
++            ids.push(IMU_DXL_ID);
++        }
++        ids.extend_from_slice(&JOINT_IDS);
++        ids
++    }
++
+     /// The body IMU's sensor→trunk mount, which is the robot's ([`SflpDecoder::DEFAULT_MOUNT`]
+     /// for a `zero3`, [`SflpDecoder::BETA_MOUNT`] for a `beta`). Starts the decoder afresh, so
+     /// call it right after [`Self::open`], before the first read.
+@@ -264,6 +303,11 @@ impl DynamixelIo {
+     /// silent IMU board otherwise surfaces as the first [`RobotIo::read`] failing — which, from
+     /// outside, looks exactly like no robot at all.
+     pub fn imu_answers(&mut self) -> Result<bool> {
++        if !self.imu_on_bus {
++            // False rather than an error: there genuinely is no board here to answer. The
++            // caller is the one that knows where the IMU went.
++            return Ok(false);
++        }
+         self.controller
+             .ping(IMU_DXL_ID)
+             .map_err(|e| IoError::Bus(format!("ping imu {IMU_DXL_ID}: {e}")))
+@@ -527,32 +571,41 @@ impl RobotIo for DynamixelIo {
+ 
+         let mut sensors = Sensors::default();
+ 
+-        // Slot 0 is the IMU board.
+-        if blocks[0].len() == IMU_BLOCK_LEN {
+-            let mut raw = [0u8; IMU_BLOCK_LEN];
+-            raw.copy_from_slice(&blocks[0]);
+-            // Say so, or the counters are numbers nobody ever reads — but only once the run
+-            // is long enough to mean something. Rate-limited past that because a board which
+-            // has stopped refreshing produces one of these every single tick, and 50 Hz of
+-            // identical warnings would evict the journal.
+-            let run = self.stale_imu.observe(&raw);
+-            if run == STALE_RUN_WARN || (run > STALE_RUN_WARN && run.is_multiple_of(500)) {
+-                tracing::warn!(
+-                    consecutive = run,
+-                    total = self.stale_imu.stale.total,
+-                    "imu board has returned the same sample {run} reads running — orientation is frozen"
+-                );
++        // Slot 0 is the IMU board when this robot has one on the bus.
++        let joints = if self.imu_on_bus {
++            if blocks[0].len() == IMU_BLOCK_LEN {
++                let mut raw = [0u8; IMU_BLOCK_LEN];
++                raw.copy_from_slice(&blocks[0]);
++                // Say so, or the counters are numbers nobody ever reads — but only once the run
++                // is long enough to mean something. Rate-limited past that because a board which
++                // has stopped refreshing produces one of these every single tick, and 50 Hz of
++                // identical warnings would evict the journal.
++                let run = self.stale_imu.observe(&raw);
++                if run == STALE_RUN_WARN || (run > STALE_RUN_WARN && run.is_multiple_of(500)) {
++                    tracing::warn!(
++                        consecutive = run,
++                        total = self.stale_imu.stale.total,
++                        "imu board has returned the same sample {run} reads running — orientation is frozen"
++                    );
++                }
++                sensors.imu = self.imu.decode(&raw);
++                &blocks[1..]
++            } else {
++                return Err(IoError::ShortRead {
++                    what: "imu block",
++                    expected: IMU_BLOCK_LEN,
++                    got: blocks[0].len(),
++                });
+             }
+-            sensors.imu = self.imu.decode(&raw);
+         } else {
+-            return Err(IoError::ShortRead {
+-                what: "imu block",
+-                expected: IMU_BLOCK_LEN,
+-                got: blocks[0].len(),
+-            });
+-        }
++            // No board on this bus, so every block is a servo. The default left in
++            // `sensors.imu` is not a claim that the robot is upright: `imu_ready` is false and
++            // stays false until a real source arrives, and `ExternalImuIo` overwrites this in
++            // the same tick it is read.
++            &blocks[..]
++        };
+ 
+-        for (joint, block) in blocks[1..].iter().enumerate() {
++        for (joint, block) in joints.iter().enumerate() {
+             if block.len() != READ_LEN as usize {
+                 return Err(IoError::ShortRead {
+                     what: "motor block",
+@@ -720,7 +773,9 @@ impl RobotIo for DynamixelIo {
+     }
+ 
+     fn imu_ready(&self) -> bool {
+-        self.imu.ready()
++        // A bus with no board on it has no orientation to be ready with. False keeps the
++        // default `ImuData` from ever being mistaken for a measurement.
++        self.imu_on_bus && self.imu.ready()
+     }
+ }
+ 
+@@ -749,6 +804,22 @@ mod tests {
+         const { assert!(READ_LEN >= 12) };
+     }
+ 
++    /// The id list is the contract `read` unpacks blocks by: with the board first, slot 0 is
++    /// an orientation and slots 1.. are joints; without it, slot 0 *is* the first joint. One
++    /// id too many and every joint is read from its neighbour's block — which presents as a
++    /// wiring fault, not as an off-by-one.
++    #[test]
++    fn the_id_list_decides_what_slot_zero_is() {
++        let with_board = DynamixelIo::ids_for(true);
++        assert_eq!(with_board.len(), NUM_JOINTS + 1);
++        assert_eq!(with_board[0], IMU_DXL_ID);
++        assert_eq!(&with_board[1..], &JOINT_IDS[..]);
++
++        let servos_only = DynamixelIo::ids_for(false);
++        assert_eq!(servos_only.len(), NUM_JOINTS);
++        assert_eq!(servos_only.as_slice(), &JOINT_IDS[..]);
++    }
++
+     /// The conversion must agree with rustypot's own `AnglePosition`, which is what
+     /// `sync_write_goal_position` uses on the way out. A mismatch would mean the loop
+     /// commands a different angle than it believes it read back.
+diff --git a/duck-control/src/imu.rs b/duck-control/src/imu.rs
+index 37e0b1e..75188b4 100644
+--- a/duck-control/src/imu.rs
++++ b/duck-control/src/imu.rs
+@@ -163,7 +163,11 @@ impl SflpDecoder {
+ 
+ /// Single-sample spike rejection. A dropped or corrupted block shows up as one wild value;
+ /// a median over three discards it without the lag of an average.
+-fn median3_each(history: &[[f64; 3]; 2], now: [f64; 3]) -> [f64; 3] {
++///
++/// Shared with [`crate::imu_icm42670p`], which faces the same dropped-read problem over I²C
++/// and must reject it the same way — two IMUs that disagreed about a spike would make the
++/// decoder a de facto part of the robot's behaviour.
++pub(crate) fn median3_each(history: &[[f64; 3]; 2], now: [f64; 3]) -> [f64; 3] {
+     let m = |a: f64, b: f64, c: f64| a.max(b).min(c).max(a.min(b));
+     [
+         m(history[0][0], history[1][0], now[0]),
+@@ -185,8 +189,9 @@ fn half(bits: u16) -> f64 {
+     }
+ }
+ 
+-/// Hamilton product, scalar-first.
+-fn mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
++/// Hamilton product, scalar-first. Shared with [`crate::imu_icm42670p`] so that the mount
++/// rotation is applied identically whichever IMU is fitted.
++pub(crate) fn mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+     let ([aw, ax, ay, az], [bw, bx, by, bz]) = (a, b);
+     [
+         aw * bw - ax * bx - ay * by - az * bz,
+@@ -197,7 +202,7 @@ fn mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+ }
+ 
+ /// `q · v · q⁻¹`
+-fn rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
++pub(crate) fn rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
+     let (t, c) = cross_terms(q, v);
+     [
+         v[0] + q[0] * t[0] + c[0],
+@@ -207,7 +212,7 @@ fn rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
+ }
+ 
+ /// `q⁻¹ · v · q` — world vector expressed in the body frame.
+-fn rotate_inverse(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
++pub(crate) fn rotate_inverse(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
+     let (t, c) = cross_terms(q, v);
+     [
+         v[0] - q[0] * t[0] + c[0],
+@@ -232,7 +237,7 @@ fn cross_terms(q: [f64; 4], v: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+ }
+ 
+ /// Unit vector, falling back to "upright" rather than dividing by ~zero.
+-fn normalise(v: [f64; 3]) -> [f64; 3] {
++pub(crate) fn normalise(v: [f64; 3]) -> [f64; 3] {
+     let mag = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+     if mag > 0.1 {
+         [v[0] / mag, v[1] / mag, v[2] / mag]
+diff --git a/duck-control/src/imu_external.rs b/duck-control/src/imu_external.rs
+new file mode 100644
+index 0000000..adffcba
+--- /dev/null
++++ b/duck-control/src/imu_external.rs
+@@ -0,0 +1,209 @@
++//! A robot whose IMU is not on the servo bus.
++//!
++//! [`crate::bus::DynamixelIo`] reads the body IMU as slot 0 of the same `sync_read` that reads
++//! the servos — the `imu_to_dxl` board pretending to be a servo. This module is the other
++//! arrangement: the servos answer as themselves, and the orientation comes from a module on
++//! I²C, which [`crate::imu_i2c`] fetches and [`crate::imu_icm42670p`] decodes.
++//!
++//! Nothing above [`RobotIo`] can tell the two apart, which is the point of the seam: the
++//! observation vector, safety, fall detection and the policy take the same `Sensors` either
++//! way. What changes is only who fills `Sensors::imu`.
++//!
++//! ## Read order matters
++//!
++//! [`RobotIo::read`] asks the joints first and the module second, then overwrites the IMU.
++//! The other order would let a servo read failure throw away a perfectly good orientation
++//! sample, and the module is the cheaper of the two.
++//!
++//! ## This is synchronous, deliberately, and that is a known limit
++//!
++//! The tick waits about a millisecond for the module. The design note for the I²C arrangement
++//! (`software/飞特适配架构.md` in the replica repository) puts the module on its own thread and
++//! has the loop copy the latest frame, precisely so a stuck bus cannot stall a servo tick. That
++//! is the right shape for a robot and it is **not** what this does yet: the thread belongs to
++//! whoever drives the loop, and this crate has no threads. Moving it is a change to the caller,
++//! not to this file — the seam above stays the same.
++
++use crate::imu_i2c::{Icm42670pI2c, RegisterBlocks};
++use crate::imu_icm42670p::Icm42670pDecoder;
++use crate::io::{IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
++
++/// Joints from one backend, orientation from an I²C module.
++pub struct ExternalImuIo<Io, B> {
++    joints: Io,
++    module: Icm42670pI2c<B>,
++    decoder: Icm42670pDecoder,
++}
++
++impl<Io: RobotIo, B: RegisterBlocks> ExternalImuIo<Io, B> {
++    /// `joints` should be a bus opened with
++    /// [`crate::bus::DynamixelIo::open_without_bus_imu`]; `mount` is module→trunk, measured on
++    /// the bench and *not* guessable — see the calibration tool.
++    pub fn new(joints: Io, module: Icm42670pI2c<B>, mount: [f64; 4]) -> Self {
++        Self {
++            joints,
++            module,
++            decoder: Icm42670pDecoder::new(mount),
++        }
++    }
++
++    /// The joints half, for the startup work that is the bus's business — the register census,
++    /// the missing-servo check, adopting a replacement.
++    pub fn joints_mut(&mut self) -> &mut Io {
++        &mut self.joints
++    }
++}
++
++impl<Io: RobotIo, B: RegisterBlocks> RobotIo for ExternalImuIo<Io, B> {
++    fn read(&mut self) -> Result<Sensors> {
++        let mut sensors = self.joints.read()?;
++        let sample = self
++            .module
++            .read_sample()
++            .map_err(|e| IoError::Bus(format!("external imu: {e}")))?;
++        // Overwrites whatever the joint backend put here. A bus opened without its board
++        // reports `ImuData::default`, and a backend that fakes one would still be wrong: the
++        // module is the only measurement of where the trunk is.
++        sensors.imu = self.decoder.decode(&sample);
++        Ok(sensors)
++    }
++
++    fn write(&mut self, targets: &JointTargets) -> Result<()> {
++        self.joints.write(targets)
++    }
++
++    fn set_gain(&mut self, kp: u16) -> Result<()> {
++        self.joints.set_gain(kp)
++    }
++
++    fn set_torque(&mut self, on: bool) -> Result<()> {
++        self.joints.set_torque(on)
++    }
++
++    fn reboot(&mut self, id: u8) -> Result<()> {
++        self.joints.reboot(id)
++    }
++
++    fn slow_sensors(&mut self) -> Result<SlowSensors> {
++        self.joints.slow_sensors()
++    }
++
++    /// The module's own convergence, not the bus's: there is no board to converge.
++    fn imu_ready(&self) -> bool {
++        self.decoder.ready()
++    }
++
++    fn measures_velocity(&self) -> bool {
++        self.joints.measures_velocity()
++    }
++
++    fn measures_load(&self) -> bool {
++        self.joints.measures_load()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::imu::ImuData;
++    use crate::imu_i2c::{REG_GYRO, REG_QUAT, TransportError};
++    use crate::io::FakeIo;
++    use crate::model::{DEFAULT_POSITION, NUM_JOINTS};
++
++    const IDENTITY: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
++
++    /// Reports the same sample every time: nose down 90°, still.
++    struct NoseDown;
++
++    impl RegisterBlocks for NoseDown {
++        fn read_register(
++            &mut self,
++            reg: u8,
++            len: usize,
++        ) -> std::result::Result<Vec<u8>, TransportError> {
++            let mut out = vec![0u8; len];
++            match reg {
++                REG_GYRO => {}
++                REG_QUAT => {
++                    let q = [
++                        std::f32::consts::FRAC_1_SQRT_2,
++                        std::f32::consts::FRAC_1_SQRT_2,
++                        0.0,
++                        0.0,
++                    ];
++                    for (chunk, value) in out.chunks_mut(4).zip(q) {
++                        chunk.copy_from_slice(&value.to_le_bytes());
++                    }
++                }
++                other => {
++                    return Err(TransportError::Bus(format!("unexpected {other:#04x}")));
++                }
++            }
++            Ok(out)
++        }
++    }
++
++    /// A module that cannot be read.
++    struct Dead;
++
++    impl RegisterBlocks for Dead {
++        fn read_register(
++            &mut self,
++            _reg: u8,
++            _len: usize,
++        ) -> std::result::Result<Vec<u8>, TransportError> {
++            Err(TransportError::Bus("remote I/O error".to_owned()))
++        }
++    }
++
++    /// The whole point of the wrapper: the module's attitude wins, even when the joint backend
++    /// has an opinion. A merge that let the bus's default survive would report a robot as
++    /// upright while it fell over.
++    #[test]
++    fn the_module_supplies_the_orientation() {
++        let mut joints = FakeIo::new();
++        joints.set_imu(ImuData::default());
++        let mut io = ExternalImuIo::new(joints, Icm42670pI2c::new(NoseDown), IDENTITY);
++        // Three reads put real values behind the decoder's median.
++        for _ in 0..3 {
++            io.read().expect("the fake module answers");
++        }
++        let sensors = io.read().expect("the fake module answers");
++        assert!(
++            (sensors.imu.gravity[1] + 1.0).abs() < 1e-6,
++            "gravity {:?} is upright, so the module was ignored",
++            sensors.imu.gravity
++        );
++    }
++
++    /// The joint half must arrive untouched — the wrapper replaces one field and nothing else.
++    #[test]
++    fn the_joint_half_passes_through() {
++        let mut joints = FakeIo::at(DEFAULT_POSITION);
++        joints.set_velocities([0.25; NUM_JOINTS]);
++        let mut io = ExternalImuIo::new(joints, Icm42670pI2c::new(NoseDown), IDENTITY);
++        let sensors = io.read().expect("the fake module answers");
++        assert_eq!(sensors.positions, DEFAULT_POSITION);
++        assert_eq!(sensors.velocities, [0.25; NUM_JOINTS]);
++    }
++
++    /// Readiness is the module's, not the bus's. A bus opened without its board is never
++    /// ready, so delegating this would leave a robot that never brings itself up.
++    #[test]
++    fn readiness_follows_the_module() {
++        let mut io = ExternalImuIo::new(FakeIo::new(), Icm42670pI2c::new(NoseDown), IDENTITY);
++        assert!(!io.imu_ready());
++        for _ in 0..Icm42670pDecoder::READY_SAMPLES {
++            io.read().expect("the fake module answers");
++        }
++        assert!(io.imu_ready());
++    }
++
++    /// A module that stops answering must fail the tick rather than hand back the last
++    /// attitude forever: a frozen orientation looks exactly like a still robot.
++    #[test]
++    fn a_dead_module_fails_the_read() {
++        let mut io = ExternalImuIo::new(FakeIo::new(), Icm42670pI2c::new(Dead), IDENTITY);
++        assert!(matches!(io.read(), Err(IoError::Bus(_))));
++    }
++}
+diff --git a/duck-control/src/imu_i2c.rs b/duck-control/src/imu_i2c.rs
+new file mode 100644
+index 0000000..2308204
+--- /dev/null
++++ b/duck-control/src/imu_i2c.rs
+@@ -0,0 +1,338 @@
++//! Reading the external IMU module over I²C.
++//!
++//! [`crate::imu_icm42670p`] decodes what this fetches. The split is deliberate: everything
++//! that can be wrong about the *module* is testable without a module, and everything that
++//! needs a bus is behind one trait with a single method.
++//!
++//! This is a blocking transport with no thread of its own. `duck-control` is not a daemon and
++//! does not own scheduling — whoever reads the module decides how often, and the module's own
++//! loop belongs to the caller.
++//!
++//! **The bus is Linux-only.** `/dev/i2c-*` exists on no other platform, so off Linux only the
++//! trait, the error and the register map are compiled — there is no bus to open and nothing
++//! that pretends otherwise. That keeps `cargo test --workspace` runnable on a developer's
++//! machine, which is the same rule `tof` follows for the head IMU.
++
++use crate::imu_icm42670p::Icm42670pSample;
++
++/// The module's I²C slave address, fixed in its firmware.
++pub const ADDRESS: u8 = 0x23;
++
++/// Gyro x/y/z, `i16` LE raw counts, ±2000 dps.
++pub const REG_GYRO: u8 = 0x0A;
++
++/// Quaternion w/x/y/z, `f32` LE, scalar-first.
++pub const REG_QUAT: u8 = 0x16;
++
++/// Fusion algorithm type: 6, 9 or 10 axes. Read it to tell this module apart from another
++/// device that happens to answer at [`ADDRESS`].
++pub const REG_ALGO_TYPE: u8 = 0x61;
++
++pub const GYRO_BYTES: usize = 6;
++pub const QUAT_BYTES: usize = 16;
++
++/// What the transport needs from a bus: one block read from a register.
++///
++/// Narrow on purpose. A fake that returns canned bytes is the whole of what a test needs to
++/// cover the read path and pin the register map — which is the part most likely to be wrong
++/// and the part no amount of bench time proves, because a wrong register usually still
++/// returns *something*.
++pub trait RegisterBlocks {
++    fn read_register(&mut self, reg: u8, len: usize) -> Result<Vec<u8>, TransportError>;
++}
++
++#[derive(Debug, thiserror::Error)]
++pub enum TransportError {
++    #[error("i2c: {0}")]
++    Bus(String),
++    #[error("register {reg:#04x} answered with {got} byte(s), the module needs {need}")]
++    ShortRead { reg: u8, got: usize, need: usize },
++}
++
++/// The module, over some bus.
++pub struct Icm42670pI2c<R> {
++    bus: R,
++}
++
++impl<R: RegisterBlocks> Icm42670pI2c<R> {
++    pub fn new(bus: R) -> Self {
++        Self { bus }
++    }
++
++    /// One sample: two block reads, no transaction between them that the caller must care about.
++    ///
++    /// The reads are independent, so a sample can straddle a fusion update and pair a fresh
++    /// quaternion with the previous gyro. At the module's 100 Hz that is 10 ms of skew, and
++    /// the alternative — re-reading until both agree — buys nothing: there is no counter to
++    /// compare them against, and the streams are produced by the same loop.
++    pub fn read_sample(&mut self) -> Result<Icm42670pSample, TransportError> {
++        let gyro = self.bus.read_register(REG_GYRO, GYRO_BYTES)?;
++        if gyro.len() < GYRO_BYTES {
++            return Err(TransportError::ShortRead {
++                reg: REG_GYRO,
++                got: gyro.len(),
++                need: GYRO_BYTES,
++            });
++        }
++        let quat = self.bus.read_register(REG_QUAT, QUAT_BYTES)?;
++        if quat.len() < QUAT_BYTES {
++            return Err(TransportError::ShortRead {
++                reg: REG_QUAT,
++                got: quat.len(),
++                need: QUAT_BYTES,
++            });
++        }
++        // Both reads are long enough, so the decode cannot fail.
++        Ok(Icm42670pSample::from_registers(&gyro, &quat).expect("both reads are long enough"))
++    }
++
++    /// Which fusion the module is running: 6, 9 or 10 axes.
++    ///
++    /// This is also the identity check. Anything can answer at [`ADDRESS`]; a device that
++    /// answers here with one of the three documented values is this module.
++    pub fn fusion_algorithm(&mut self) -> Result<u8, TransportError> {
++        let bytes = self.bus.read_register(REG_ALGO_TYPE, 1)?;
++        bytes.first().copied().ok_or(TransportError::ShortRead {
++            reg: REG_ALGO_TYPE,
++            got: 0,
++            need: 1,
++        })
++    }
++}
++
++#[cfg(target_os = "linux")]
++mod bus {
++    use std::path::{Path, PathBuf};
++
++    use embedded_hal::i2c::I2c as _;
++    use linux_embedded_hal::I2cdev;
++
++    use super::{ADDRESS, Icm42670pI2c, RegisterBlocks, TransportError};
++
++    /// Where to look when the caller names no bus.
++    ///
++    /// The first three are the robot's wiring, not a preference. `/dev/i2c-pihat` is the symlink
++    /// the official HAT's overlay creates; `/dev/i2c-3` is the same 40-pin I²C3 the HAT's J5
++    /// header breaks out; `/dev/i2c-4` is what J6 becomes once R18/R19 move to R16/R17.
++    ///
++    /// The last two are **not** the robot: they are the header buses a bench brings up on a
++    /// Raspberry Pi (`/dev/i2c-1`) and a Jetson Orin (`/dev/i2c-7`). Reading a module there
++    /// proves the transport, the module and the decode; it says nothing about the Radxa's I²C
++    /// controller, which is the one part of this that only the real board can answer. The
++    /// numbering differs per board *and* per JetPack release, so anyone who knows their bus
++    /// should name it rather than trust this list.
++    pub const BUS_CANDIDATES: [&str; 5] = [
++        "/dev/i2c-pihat",
++        "/dev/i2c-3",
++        "/dev/i2c-4",
++        "/dev/i2c-1",
++        "/dev/i2c-7",
++    ];
++
++    impl RegisterBlocks for I2cdev {
++        fn read_register(&mut self, reg: u8, len: usize) -> Result<Vec<u8>, TransportError> {
++            let mut buf = vec![0u8; len];
++            // The register address and the payload are one transaction: a write of the
++            // address, a repeated start, then the read. Splitting them lets another master
++            // interleave and is not what the module's own driver does.
++            self.write_read(ADDRESS, &[reg], &mut buf).map_err(|e| {
++                TransportError::Bus(format!("read {reg:#04x} at {ADDRESS:#04x}: {e:?}"))
++            })?;
++            Ok(buf)
++        }
++    }
++
++    /// Open the module on the first bus that answers, or say what each one said.
++    ///
++    /// `named` is honoured literally: a path the caller asked for is never second-guessed, so
++    /// a typo in a config file fails loudly instead of silently reading a different module.
++    ///
++    /// The probe is a read of the fusion-algorithm register rather than the gyro, because it
++    /// is one byte and because a value only this module produces is the difference between
++    /// "something acked" and "the module is here".
++    pub fn open_first(named: Option<&Path>) -> Result<Icm42670pI2c<I2cdev>, TransportError> {
++        let candidates: Vec<PathBuf> = match named {
++            Some(path) => vec![path.to_path_buf()],
++            None => BUS_CANDIDATES.iter().map(PathBuf::from).collect(),
++        };
++
++        let mut last = None;
++        for path in &candidates {
++            if !path.exists() {
++                last = Some(TransportError::Bus(format!(
++                    "{} does not exist",
++                    path.display()
++                )));
++                continue;
++            }
++            let bus = match I2cdev::new(path) {
++                Ok(bus) => bus,
++                Err(e) => {
++                    last = Some(TransportError::Bus(format!(
++                        "open {}: {e:?}",
++                        path.display()
++                    )));
++                    continue;
++                }
++            };
++            let mut module = Icm42670pI2c::new(bus);
++            match module.fusion_algorithm() {
++                Ok(algo) => {
++                    tracing::info!(
++                        bus = %path.display(),
++                        address = %format_args!("{ADDRESS:#04x}"),
++                        algorithm = algo,
++                        "the IMU module answered"
++                    );
++                    return Ok(module);
++                }
++                Err(e) => {
++                    // A bus that exists but has nothing at ADDRESS is the common case — the
++                    // module is on another header — and it must not read as a failure of the
++                    // bus it was not on.
++                    last = Some(TransportError::Bus(format!("{}: {e}", path.display())));
++                }
++            }
++        }
++
++        Err(last.unwrap_or_else(|| TransportError::Bus("no bus to look on".to_owned())))
++    }
++}
++
++#[cfg(target_os = "linux")]
++pub use bus::{BUS_CANDIDATES, open_first};
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Records what it was asked for and answers from a script. Standing in for the bus is the
++    /// only way to test the read path off a board, and it is the read path — register numbers
++    /// and lengths — that a bench session cannot confirm, since a wrong register still returns
++    /// bytes.
++    struct Fake {
++        gyro: Vec<u8>,
++        quat: Vec<u8>,
++        algo: Vec<u8>,
++        asked: Vec<(u8, usize)>,
++    }
++
++    impl Fake {
++        fn new() -> Self {
++            let mut quat = Vec::new();
++            for c in [1.0f32, 0.0, 0.0, 0.0] {
++                quat.extend_from_slice(&c.to_le_bytes());
++            }
++            Self {
++                gyro: [1000i16, 0, 0]
++                    .iter()
++                    .flat_map(|v| v.to_le_bytes())
++                    .collect(),
++                quat,
++                algo: vec![6],
++                asked: Vec::new(),
++            }
++        }
++    }
++
++    impl RegisterBlocks for Fake {
++        fn read_register(&mut self, reg: u8, len: usize) -> Result<Vec<u8>, TransportError> {
++            self.asked.push((reg, len));
++            let src = match reg {
++                REG_GYRO => &self.gyro,
++                REG_QUAT => &self.quat,
++                REG_ALGO_TYPE => &self.algo,
++                other => {
++                    return Err(TransportError::Bus(format!(
++                        "unexpected register {other:#04x}"
++                    )));
++                }
++            };
++            Ok(src.iter().take(len).copied().collect())
++        }
++    }
++
++    /// The register map is the one thing a bench cannot check: a wrong register that happens to
++    /// exist returns plausible bytes and the robot walks with someone else's data.
++    #[test]
++    fn a_sample_reads_the_documented_registers() {
++        let mut module = Icm42670pI2c::new(Fake::new());
++        let sample = module.read_sample().expect("the fake answers");
++        assert_eq!(
++            module.bus.asked,
++            [(REG_GYRO, GYRO_BYTES), (REG_QUAT, QUAT_BYTES)]
++        );
++        assert_eq!(sample.gyro, [1000, 0, 0]);
++        assert_eq!(sample.quat, [1.0, 0.0, 0.0, 0.0]);
++    }
++
++    /// A register that answers short is not a sample. Passing it up would let a truncated read
++    /// become an orientation, and a truncated read of zeros is a robot reported as upright.
++    #[test]
++    fn a_short_read_is_an_error_not_a_sample() {
++        let mut fake = Fake::new();
++        fake.gyro.truncate(4);
++        let mut module = Icm42670pI2c::new(fake);
++        match module.read_sample() {
++            Err(TransportError::ShortRead { reg, got, need }) => {
++                assert_eq!((reg, got, need), (REG_GYRO, 4, GYRO_BYTES));
++            }
++            other => panic!("expected a short read, got {other:?}"),
++        }
++    }
++
++    /// The quaternion is read second, so its truncation has to be blamed on its own register —
++    /// a diagnosis pointing at the gyro would send someone to the wrong half of the protocol.
++    #[test]
++    fn a_short_quaternion_read_names_the_quaternion_register() {
++        let mut fake = Fake::new();
++        fake.quat.truncate(15);
++        let mut module = Icm42670pI2c::new(fake);
++        match module.read_sample() {
++            Err(TransportError::ShortRead { reg, got, need }) => {
++                assert_eq!((reg, got, need), (REG_QUAT, 15, QUAT_BYTES));
++            }
++            other => panic!("expected a short read, got {other:?}"),
++        }
++    }
++
++    /// The bus failing must not be reported as the module answering: the first is a wiring
++    /// problem and the second is a firmware one, and they send you to different places.
++    #[test]
++    fn a_bus_failure_is_not_swallowed() {
++        struct Broken;
++        impl RegisterBlocks for Broken {
++            fn read_register(&mut self, _reg: u8, _len: usize) -> Result<Vec<u8>, TransportError> {
++                Err(TransportError::Bus("remote I/O error".to_owned()))
++            }
++        }
++        let mut module = Icm42670pI2c::new(Broken);
++        assert!(matches!(module.read_sample(), Err(TransportError::Bus(_))));
++    }
++
++    /// The algorithm type is the identity check, so it has to read one byte from its own
++    /// register — reading the gyro and hoping would identify nothing.
++    #[test]
++    fn the_identity_probe_reads_the_algorithm_register() {
++        let mut module = Icm42670pI2c::new(Fake::new());
++        assert_eq!(module.fusion_algorithm().expect("the fake answers"), 6);
++        assert_eq!(module.bus.asked, [(REG_ALGO_TYPE, 1)]);
++    }
++
++    /// An empty answer is not a value. Treating it as one would have the probe accept a bus
++    /// with nothing on it.
++    #[test]
++    fn an_empty_probe_answer_is_an_error() {
++        let mut fake = Fake::new();
++        fake.algo.clear();
++        let mut module = Icm42670pI2c::new(fake);
++        assert!(matches!(
++            module.fusion_algorithm(),
++            Err(TransportError::ShortRead {
++                reg: REG_ALGO_TYPE,
++                got: 0,
++                ..
++            })
++        ));
++    }
++}
+diff --git a/duck-control/src/imu_icm42670p.rs b/duck-control/src/imu_icm42670p.rs
+new file mode 100644
+index 0000000..153dc81
+--- /dev/null
++++ b/duck-control/src/imu_icm42670p.rs
+@@ -0,0 +1,445 @@
++//! The external IMU module (TDK ICM-42670-P, as sold), decoded.
++//!
++//! Not to be confused with [`crate::imu`], which decodes the `imu_to_dxl` board that rides
++//! the servo bus. This one is an I²C slave at `0x23` and does **not** share the bus with the
++//! servos — a separate thread reads it, so the control tick never waits on this.
++//!
++//! The module ships its own fused attitude, which makes the host's job smaller than the bus
++//! board's: the quaternion arrives whole, `w` included, as four `f32`. There is nothing to
++//! derive and no fusion to run.
++//!
++//! Registers, from the module's protocol sheet:
++//!
++//! | reg  | bytes | contents |
++//! |------|-------|----------|
++//! | 0x0A | 6     | gyro x/y/z, `i16` LE raw counts, ±2000 dps |
++//! | 0x16 | 16    | quaternion w/x/y/z, `f32` LE, scalar-first |
++//!
++//! Three properties of the module that a reader of this file would otherwise take for a bug:
++//!
++//! * **The raw gyro reads exactly 0 while the module believes it is still.** Measured on a
++//!   stationary module: 999 of 999 frames zero on all three axes, against 1675–1707 distinct
++//!   values once rotated by hand. That is a stillness gate, not a dead sensor, and it is
++//!   harmless here because the policy's other IMU input — projected gravity — keeps
++//!   updating. **Its threshold is far below anything the robot does**: measured against a
++//!   quaternion-derived true rate, the gyro was live in 97% of intervals below 0.5 °/s and
++//!   reported at 0.14 °/s, so slow movement does not switch it off and nothing a gait
++//!   produces will.
++//! * **It runs at 100 Hz out of the box.** The protocol sheet says the default is 25 Hz, but
++//!   the unit measured 99.8 Hz frame arrival with 98.9 Hz of genuinely new values.
++//! * **Roughly one read in a hundred returns an all-zero quaternion block.** Measured on the
++//!   robot's bus, polling `0x16` at 100 Hz: 8 of 1000 reads came back as sixteen zero bytes,
++//!   and one more had a norm of 0.195. The module appears to clear the block while its fusion
++//!   writes it, so a read landing in that window sees no quaternion at all — the window is a
++//!   fixed slice of each cycle, so reading *slower* collides less often, not more. This is what
++//!   the norm guard below is for; an unguarded decoder would report a robot as upright every
++//!   time it happened. The cost of guarding is one tick of stale attitude under 2% of the time,
++//!   which is the right trade against an orientation that is simply wrong.
++//! * **The quaternion is systematically short of unit.** Measured over the same 1000 reads:
++//!   mean norm 0.9975, and never above 0.9983 — it does not round up to 1. The acceptance band
++//!   is far wider than that on purpose, because its job is to catch a zeroed or mangled block,
++//!   not to police precision.
++//! * **The first sample after start-up is reported as the initial state, not as the
++//!   measurement.** `median3_each` takes a median over the two prior samples and the current
++//!   one, and both histories start at their defaults — gyro zero, gravity upright. A median
++//!   of (initial, initial, measured) is the initial value, so the first tick of a robot held
++//!   sideways still reads as perfectly upright. From the second sample on the median is over
++//!   two real values and is exact. The bus board behaves the same way, and this is the
++//!   sharpest reason nothing may act on the orientation before [`Icm42670pDecoder::ready`].
++//!
++//! As with the bus board, mount rotation is applied here and samples arrive in the module's
++//! own axes — nothing upstream of this file pre-rotates anything.
++
++use crate::imu::{ImuData, median3_each, mul, normalise, rotate, rotate_inverse};
++
++/// Gyro full scale: ±2000 dps across the `i16` range. The protocol sheet rounds this to
++/// 0.061 (°/s)/LSB; the exact figure is 0.061037.
++const GYRO_DPS_PER_LSB: f64 = 2000.0 / 32767.0;
++
++/// Gyro counts → rad/s. 32767 counts is exactly 2000 dps.
++pub const GYRO_RAD_PER_LSB: f64 = GYRO_DPS_PER_LSB * std::f64::consts::PI / 180.0;
++
++/// Accepted `|q|` for a sample to count as the module's fused output.
++///
++/// The module ships `f32`, so this is a real unit quaternion and can be held to a real unit
++/// norm — unlike the bus board, whose half-precision components need headroom for rounding
++/// at full scale. A fresh unit measured 0.9983. Outside the band is a short read, a bus
++/// glitch or a cold start, none of which is a measurement.
++const QUAT_NORM: (f64, f64) = (0.9, 1.1);
++
++/// One read of the module, in the module's own axes — no scaling applied.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct Icm42670pSample {
++    /// Gyro x/y/z, raw counts, ±2000 dps.
++    pub gyro: [i16; 3],
++    /// Quaternion w/x/y/z, scalar-first, as the module fused it.
++    pub quat: [f32; 4],
++}
++
++impl Icm42670pSample {
++    /// Decode the module's two register reads: `0x0A` (6 bytes) and `0x16` (16 bytes).
++    ///
++    /// `None` on a short slice. A truncated read is not a sample, and filling the gap with
++    /// zeros would look exactly like a robot standing still and perfectly upright — the one
++    /// lie fall detection must never be told.
++    pub fn from_registers(gyro: &[u8], quat: &[u8]) -> Option<Self> {
++        if gyro.len() < 6 || quat.len() < 16 {
++            return None;
++        }
++        Some(Self {
++            gyro: [
++                i16::from_le_bytes([gyro[0], gyro[1]]),
++                i16::from_le_bytes([gyro[2], gyro[3]]),
++                i16::from_le_bytes([gyro[4], gyro[5]]),
++            ],
++            quat: [
++                f32::from_le_bytes([quat[0], quat[1], quat[2], quat[3]]),
++                f32::from_le_bytes([quat[4], quat[5], quat[6], quat[7]]),
++                f32::from_le_bytes([quat[8], quat[9], quat[10], quat[11]]),
++                f32::from_le_bytes([quat[12], quat[13], quat[14], quat[15]]),
++            ],
++        })
++    }
++}
++
++/// Decodes the module's samples into [`ImuData`].
++///
++/// State and rules deliberately mirror [`crate::imu::SflpDecoder`], because the consumers
++/// above cannot tell the two apart and should not have to: the last good quaternion is held
++/// across a bad read rather than snapped to identity, and orientation is not called measured
++/// until it has been seen [`Icm42670pDecoder::READY_SAMPLES`] times.
++pub struct Icm42670pDecoder {
++    /// Module→trunk mounting rotation, scalar-first. Measured on the bench, never assumed.
++    mount: [f64; 4],
++    /// Last quaternion the module actually produced.
++    last_quat: [f64; 4],
++    /// Samples carrying a usable quaternion. Gates [`Icm42670pDecoder::ready`].
++    quat_samples: u32,
++    gyro_history: [[f64; 3]; 2],
++    gravity_history: [[f64; 3]; 2],
++}
++
++impl Icm42670pDecoder {
++    /// Samples before the orientation counts as measured — 0.25 s at the module's 100 Hz.
++    pub const READY_SAMPLES: u32 = 25;
++
++    /// `mount` is module→trunk. There is no default: a guessed mounting angle is the one
++    /// error that passes every electrical check and still makes the robot fall the wrong way.
++    pub fn new(mount: [f64; 4]) -> Self {
++        Self {
++            mount,
++            last_quat: [1.0, 0.0, 0.0, 0.0],
++            quat_samples: 0,
++            gyro_history: [[0.0; 3]; 2],
++            gravity_history: [[0.0, 0.0, -1.0]; 2],
++        }
++    }
++
++    /// Whether the module has demonstrably produced fused output.
++    ///
++    /// Until this is true the orientation is a default, not a measurement, and fall
++    /// detection must not run on it.
++    pub fn ready(&self) -> bool {
++        self.quat_samples >= Self::READY_SAMPLES
++    }
++
++    /// Quaternions accepted so far, which is [`Self::decode`] calls minus the rejected ones.
++    ///
++    /// Worth watching on a new module: a rejection is silent to every consumer, because the
++    /// previous orientation is held rather than reported as bad. A handful over a start-up is
++    /// the module settling; a steady trickle means the policy is being fed a stale attitude
++    /// every so often, and neither the loop nor fall detection can tell.
++    pub fn quat_samples(&self) -> u32 {
++        self.quat_samples
++    }
++
++    pub fn decode(&mut self, sample: &Icm42670pSample) -> ImuData {
++        let gyro_sensor = [
++            f64::from(sample.gyro[0]) * GYRO_RAD_PER_LSB,
++            f64::from(sample.gyro[1]) * GYRO_RAD_PER_LSB,
++            f64::from(sample.gyro[2]) * GYRO_RAD_PER_LSB,
++        ];
++        let gyro = rotate(self.mount, gyro_sensor);
++
++        let sensor = [
++            f64::from(sample.quat[0]),
++            f64::from(sample.quat[1]),
++            f64::from(sample.quat[2]),
++            f64::from(sample.quat[3]),
++        ];
++        let norm = (sensor[0] * sensor[0]
++            + sensor[1] * sensor[1]
++            + sensor[2] * sensor[2]
++            + sensor[3] * sensor[3])
++            .sqrt();
++        // `norm` is NaN for a corrupted read and every comparison against NaN is false, so
++        // the range check rejects those too.
++        if sensor.iter().all(|c| c.is_finite()) && (QUAT_NORM.0..=QUAT_NORM.1).contains(&norm) {
++            let mount_inv = [
++                self.mount[0],
++                -self.mount[1],
++                -self.mount[2],
++                -self.mount[3],
++            ];
++            let q = mul(sensor, mount_inv);
++            let q_norm = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
++            if q_norm > 0.5 {
++                self.last_quat = [q[0] / q_norm, q[1] / q_norm, q[2] / q_norm, q[3] / q_norm];
++                self.quat_samples = self.quat_samples.saturating_add(1);
++            }
++        }
++
++        let gravity = normalise(rotate_inverse(self.last_quat, [0.0, 0.0, -1.0]));
++
++        let out = ImuData {
++            gyro: median3_each(&self.gyro_history, gyro),
++            gravity: median3_each(&self.gravity_history, gravity),
++            quat: self.last_quat,
++        };
++        self.gyro_history = [self.gyro_history[1], gyro];
++        self.gravity_history = [self.gravity_history[1], gravity];
++        out
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const SQRT_HALF: f32 = std::f32::consts::FRAC_1_SQRT_2;
++
++    const IDENTITY: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
++
++    /// The `zero3`-style mounting the bus board uses: module axes sit +90° about Y from the
++    /// trunk's. A fixture only — a real mount comes from the bench calibration.
++    const MOUNT_Y90: [f64; 4] = [
++        std::f64::consts::FRAC_1_SQRT_2,
++        0.0,
++        std::f64::consts::FRAC_1_SQRT_2,
++        0.0,
++    ];
++
++    /// A quaternion the module actually produced, flat on a bench and yawed ~75°, captured
++    /// over the serial link. Replaying real hardware beats testing only with values we
++    /// picked to be convenient.
++    const MEASURED: [f32; 4] = [0.7923, 0.0039, -0.0071, -0.6073];
++
++    fn sample(gyro: [i16; 3], quat: [f32; 4]) -> Icm42670pSample {
++        Icm42670pSample { gyro, quat }
++    }
++
++    /// The median takes the two prior samples with it, so the very first output is the
++    /// initial history rather than the measurement. Three decodes leave three real values
++    /// behind the median, which is what every assertion below needs.
++    fn decode_warm(d: &mut Icm42670pDecoder, s: &Icm42670pSample) -> ImuData {
++        d.decode(s);
++        d.decode(s);
++        d.decode(s)
++    }
++
++    /// This is what turns counts into the rad/s the policy was trained on. Pinned against
++    /// the protocol sheet's rounded 0.061 (°/s)/LSB, and against the full-scale endpoint,
++    /// which must land on exactly ±2000 dps — a wrong scale is a silently wrong gait.
++    #[test]
++    fn gyro_scale_matches_the_protocol_sheet() {
++        let dps_per_lsb = GYRO_RAD_PER_LSB * 180.0 / std::f64::consts::PI;
++        assert!((dps_per_lsb - 0.061).abs() < 5e-5, "{dps_per_lsb}");
++        assert!((32767.0 * dps_per_lsb - 2000.0).abs() < 1e-6);
++    }
++
++    /// No mount, no rotation: what the module says is what the trunk gets.
++    #[test]
++    fn identity_mount_passes_the_gyro_through() {
++        let mut d = Icm42670pDecoder::new(IDENTITY);
++        let out = decode_warm(&mut d, &sample([1000, 0, 0], [1.0, 0.0, 0.0, 0.0]));
++        assert!(
++            (out.gyro[0] - 1000.0 * GYRO_RAD_PER_LSB).abs() < 1e-9,
++            "{:?}",
++            out.gyro
++        );
++        assert_eq!(out.gyro[1], 0.0);
++        assert_eq!(out.gyro[2], 0.0);
++    }
++
++    /// A +90° mount about Y sends a module +X rate to trunk −Z. Sign errors here are the
++    /// ones that pass every electrical check and still make the duck fall the wrong way.
++    #[test]
++    fn mount_rotates_the_gyro_into_the_trunk_frame() {
++        let mut d = Icm42670pDecoder::new(MOUNT_Y90);
++        let out = decode_warm(&mut d, &sample([1000, 0, 0], [1.0, 0.0, 0.0, 0.0]));
++        assert!(out.gyro[0].abs() < 1e-9, "{:?}", out.gyro);
++        assert!(out.gyro[1].abs() < 1e-9, "{:?}", out.gyro);
++        assert!(
++            (out.gyro[2] + 1000.0 * GYRO_RAD_PER_LSB).abs() < 1e-9,
++            "{:?}",
++            out.gyro
++        );
++    }
++
++    /// Projected gravity is the other half of the policy's IMU input, and the only part that
++    /// says which way is down. Pinned for the attitudes the bench calibration puts the robot
++    /// in, because a mount that is right about gyro and wrong about gravity still falls.
++    #[test]
++    fn gravity_follows_the_quaternion() {
++        let cases: [(&str, [f32; 4], [f64; 3]); 4] = [
++            ("level", [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
++            (
++                "+90° about X",
++                [SQRT_HALF, SQRT_HALF, 0.0, 0.0],
++                [0.0, -1.0, 0.0],
++            ),
++            (
++                "−90° about X",
++                [SQRT_HALF, -SQRT_HALF, 0.0, 0.0],
++                [0.0, 1.0, 0.0],
++            ),
++            (
++                "+90° about Y",
++                [SQRT_HALF, 0.0, SQRT_HALF, 0.0],
++                [1.0, 0.0, 0.0],
++            ),
++        ];
++        for (name, q, want) in cases {
++            let mut d = Icm42670pDecoder::new(IDENTITY);
++            let out = decode_warm(&mut d, &sample([0, 0, 0], q));
++            for i in 0..3 {
++                assert!(
++                    (out.gravity[i] - want[i]).abs() < 1e-6,
++                    "{name}: gravity {:?} != {want:?}",
++                    out.gravity
++                );
++            }
++        }
++    }
++
++    /// The decode stays honest against hardware, not just against quaternions chosen to be
++    /// convenient. Expects the values a Python re-implementation of these helpers produced
++    /// for this same sample.
++    #[test]
++    fn decodes_a_measured_sample() {
++        let mut d = Icm42670pDecoder::new(IDENTITY);
++        let out = decode_warm(&mut d, &sample([0, 0, 0], MEASURED));
++        let want = [-0.0065, -0.0149, -0.9999];
++        for i in 0..3 {
++            assert!(
++                (out.gravity[i] - want[i]).abs() < 1e-3,
++                "gravity {:?} != {want:?}",
++                out.gravity
++            );
++        }
++        // Arrived at |q| = 0.9983; normalising is part of the decode.
++        let norm = out.quat.iter().map(|c| c * c).sum::<f64>().sqrt();
++        assert!((norm - 1.0).abs() < 1e-9, "|q| = {norm}");
++    }
++
++    /// A read that never came from the fusion must not move the orientation. The all-zero
++    /// case is what a failed I²C transaction most often leaves behind, and a decoder that
++    /// accepted it would report a robot as upright while it fell.
++    #[test]
++    fn bad_quaternions_do_not_move_the_orientation() {
++        for (name, bad) in [
++            ("all zero", [0.0f32, 0.0, 0.0, 0.0]),
++            ("not a number", [f32::NAN, 0.0, 0.0, 0.0]),
++            ("infinite", [f32::INFINITY, 0.0, 0.0, 0.0]),
++            ("twice unit", [2.0, 0.0, 0.0, 0.0]),
++            ("0.6 short", [0.6, 0.0, 0.0, 0.0]),
++        ] {
++            let mut d = Icm42670pDecoder::new(IDENTITY);
++            let before = d.decode(&sample([0, 0, 0], MEASURED)).quat;
++            let after = d.decode(&sample([0, 0, 0], bad)).quat;
++            assert_eq!(before, after, "{name} moved the quaternion");
++            assert_eq!(d.quat_samples, 1, "{name} was counted as a sample");
++        }
++    }
++
++    /// The stillness gate: the module zeroes its raw gyro while it thinks it is still, so a
++    /// decoder that needed a rate to trust the attitude would lose orientation the moment
++    /// the robot held still. Projected gravity is the part that keeps working.
++    #[test]
++    fn a_still_module_still_reports_attitude() {
++        let mut d = Icm42670pDecoder::new(IDENTITY);
++        let out = decode_warm(&mut d, &sample([0, 0, 0], [SQRT_HALF, SQRT_HALF, 0.0, 0.0]));
++        assert_eq!(out.gyro, [0.0, 0.0, 0.0]);
++        assert!((out.gravity[1] + 1.0).abs() < 1e-6, "{:?}", out.gravity);
++    }
++
++    /// A dropped read shows up as one wild value; the median drops it without an average's
++    /// lag. The failure it prevents is a single dropped I²C transaction throwing the policy
++    /// an angular velocity it never had.
++    #[test]
++    fn a_spike_between_two_good_samples_is_discarded() {
++        let mut d = Icm42670pDecoder::new(IDENTITY);
++        let q = [1.0f32, 0.0, 0.0, 0.0];
++        d.decode(&sample([1000, 0, 0], q));
++        d.decode(&sample([1000, 0, 0], q));
++        let spiked = d.decode(&sample([32767, 0, 0], q));
++        assert!(
++            (spiked.gyro[0] - 1000.0 * GYRO_RAD_PER_LSB).abs() < 1e-9,
++            "spike leaked through: {}",
++            spiked.gyro[0]
++        );
++    }
++
++    /// Fall detection must not run before the orientation is a measurement rather than the
++    /// initial default — the two-sample median warm-up is exactly when that matters most.
++    #[test]
++    fn ready_waits_for_twenty_five_quaternions() {
++        let mut d = Icm42670pDecoder::new(IDENTITY);
++        let q = [1.0f32, 0.0, 0.0, 0.0];
++        for n in 1..Icm42670pDecoder::READY_SAMPLES {
++            d.decode(&sample([0, 0, 0], q));
++            assert!(!d.ready(), "ready after {n} samples");
++        }
++        d.decode(&sample([0, 0, 0], q));
++        assert!(
++            d.ready(),
++            "not ready after {}",
++            Icm42670pDecoder::READY_SAMPLES
++        );
++    }
++
++    /// A bad read must not advance readiness, or a module wired to nothing would look ready
++    /// after 25 attempts and fall detection would be armed over a default orientation.
++    #[test]
++    fn bad_samples_do_not_count_towards_readiness() {
++        let mut d = Icm42670pDecoder::new(IDENTITY);
++        for _ in 0..100 {
++            d.decode(&sample([0, 0, 0], [0.0, 0.0, 0.0, 0.0]));
++        }
++        assert!(!d.ready());
++        assert_eq!(d.quat_samples, 0);
++    }
++
++    /// The module's registers are little-endian throughout; reading them big-endian flips
++    /// the sign of every rate and mirrors the horizon.
++    #[test]
++    fn register_reads_decode_little_endian() {
++        let gyro: Vec<u8> = [1000i16, -1000, 32767]
++            .iter()
++            .flat_map(|v| v.to_le_bytes())
++            .collect();
++        let quat: Vec<u8> = [1.0f32, 0.0, 0.0, 0.0]
++            .iter()
++            .flat_map(|v| v.to_le_bytes())
++            .collect();
++        let s = Icm42670pSample::from_registers(&gyro, &quat).expect("full reads decode");
++        assert_eq!(s.gyro, [1000, -1000, 32767]);
++        assert_eq!(s.quat, [1.0, 0.0, 0.0, 0.0]);
++    }
++
++    /// A short read is not a sample. Reporting it as one is how a robot that lost its IMU
++    /// gets reported as standing perfectly still.
++    #[test]
++    fn short_reads_are_not_samples() {
++        assert!(Icm42670pSample::from_registers(&[0; 5], &[0; 16]).is_none());
++        assert!(Icm42670pSample::from_registers(&[0; 6], &[0; 15]).is_none());
++        assert!(Icm42670pSample::from_registers(&[0; 6], &[0; 16]).is_some());
++    }
++
++    /// Extra trailing bytes are the transport's business, not the decoder's — a burst read
++    /// that overshoots the register of interest still carries the sample.
++    #[test]
++    fn longer_reads_are_accepted() {
++        assert!(Icm42670pSample::from_registers(&[1, 0, 0, 0, 0, 0, 9, 9], &[0; 20]).is_some());
++    }
++}
+diff --git a/duck-control/src/lib.rs b/duck-control/src/lib.rs
+index e4769b5..819948b 100644
+--- a/duck-control/src/lib.rs
++++ b/duck-control/src/lib.rs
+@@ -10,6 +10,12 @@
+ pub mod bus;
+ pub mod fall;
+ pub mod imu;
++/// Joints from the servo bus, orientation from a module that is not on it.
++pub mod imu_external;
++/// The bus that module sits on. Linux-only in its body; the register map is not.
++pub mod imu_i2c;
++/// The external IMU module, read over I²C instead of ridden along on the servo bus.
++pub mod imu_icm42670p;
+ pub mod io;
+ pub mod model;
+ pub mod obs;
